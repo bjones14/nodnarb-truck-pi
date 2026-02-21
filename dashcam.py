@@ -4,37 +4,34 @@ import threading
 import datetime
 import subprocess
 import psutil
+import json
 import paho.mqtt.client as mqtt
 from flask import Flask, send_from_directory
 
 app = Flask(__name__)
 
-# --- CONFIGURATION ---
-DISK_PATH = "/mnt/dashcam"
-RAM_DISK = "/dev/shm"
+# Load Configuration
+CONFIG_PATH = os.path.join(os.path.dirname(__file__), 'config.json')
+with open(CONFIG_PATH, 'r') as f:
+    config = json.load(f)
+
+# --- CONFIGURATION FROM FILE ---
+DISK_PATH = config['paths']['dashcam_mount']
+RAM_DISK = config['paths']['ram_disk']
+WIFI_PREFIX = config['wifi']['prefix']
+BROKER_IP = config['mqtt']['broker']
+MQTT_USER = config['mqtt']['user']
+MQTT_PASS = config['mqtt']['pass']
+
 MAX_DISK_USAGE_PERCENT = 90
 CHUNK_SECONDS = 300
-
-# --- MQTT STATUS REPORTING ---
-BROKER_IP = "homeassistant"
-MQTT_USER = "truck"
-MQTT_PASS = "truck"
 STATUS_TOPIC = "truck/dashcam/status"
 
-# --- GEOFENCING CONFIG ---
-WIFI_PREFIX = "Waldon_"
+# Global State
 garage_mode_active = False
 
-# Global CPU tracker to keep overhead at near-zero
-def get_cpu_reading():
-    try:
-        # Non-blocking call: returns usage since last call
-        return psutil.cpu_percent(interval=None)
-    except:
-        return 0.0
-
 def report_status(msg):
-    """Pushes mode changes to MQTT with a short timeout."""
+    """Pushes mode changes to MQTT using a background thread."""
     def _do_report():
         try:
             client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
@@ -43,15 +40,13 @@ def report_status(msg):
             client.publish(STATUS_TOPIC, msg, retain=True)
             client.disconnect()
         except: pass
-    # Run in thread to not block the main logic
     threading.Thread(target=_do_report, daemon=True).start()
 
 def check_wifi_geofence():
-    """Polls for 'Waldon_' networks every 60s (low overhead)."""
+    """Polls for home networks every 60s to minimize CPU impact."""
     global garage_mode_active
     while True:
         try:
-            # Simple check for active SSID
             cmd = "nmcli -t -f ACTIVE,SSID dev wifi | grep '^yes' | cut -d':' -f2"
             current_ssid = subprocess.check_output(cmd, shell=True, encoding='utf-8').strip()
 
@@ -68,12 +63,10 @@ def check_wifi_geofence():
                 garage_mode_active = False
         time.sleep(60)
 
-# Start geofence monitor
 threading.Thread(target=check_wifi_geofence, daemon=True).start()
 
-# --- AUTOMATIC STORAGE MANAGER ---
 def disk_cleaner():
-    """Checked every 10 mins; very low impact."""
+    """Cleanup old clips every 10 mins."""
     while True:
         try:
             stat = os.statvfs(DISK_PATH)
@@ -91,9 +84,8 @@ def disk_cleaner():
         except: pass
         time.sleep(600)
 
-# --- THE PRO RECORDING ENGINE ---
 def record_loop():
-    """Optimized recording loop using process waiting instead of polling."""
+    """Manages the FFmpeg process with low-frequency polling."""
     for f in os.listdir(RAM_DISK):
         if f.startswith('stream') and (f.endswith('.m3u8') or f.endswith('.ts')):
             try: os.remove(os.path.join(RAM_DISK, f))
@@ -123,16 +115,11 @@ def record_loop():
             threading.Thread(target=generate_srt, args=(srt_file,), daemon=True).start()
 
         process = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        # We only poll once every 10 seconds to check for garage mode transitions
-        # This significantly reduces CPU jitter
-        while process.poll() is None:
-            current_is_recording = (not garage_mode_active)
-            is_cmd_recording = ("mp4" in ffmpeg_cmd[ffmpeg_cmd.index("-c:v")+1:ffmpeg_cmd.index("-c:v")+3])
 
-            if garage_mode_active and is_cmd_recording:
-                process.terminate()
-                break
-            elif not garage_mode_active and not is_cmd_recording:
+        while process.poll() is None:
+            # Check for mode mismatch
+            is_cmd_recording = ("mp4" in str(ffmpeg_cmd))
+            if garage_mode_active == is_cmd_recording:
                 process.terminate()
                 break
             time.sleep(10)
@@ -140,11 +127,10 @@ def record_loop():
         process.wait()
 
 def generate_srt(srt_file):
-    """SRT generator with zero busy-waiting."""
+    """Generates telemetry subtitles with non-blocking CPU calls."""
     srt_index = 1
     start_time = time.time()
-    # Initial call to psutil to prime the delta
-    psutil.cpu_percent(interval=None)
+    psutil.cpu_percent(interval=None) 
 
     try:
         with open(srt_file, "w") as f:
@@ -164,7 +150,6 @@ def generate_srt(srt_file):
                 time.sleep(1.0)
     except: pass
 
-# --- HLS WEB SERVER ---
 @app.route('/stream.m3u8')
 def stream_m3u8():
     return send_from_directory(RAM_DISK, 'stream.m3u8')
