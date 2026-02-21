@@ -1,0 +1,15 @@
+{
+	"mqtt": {
+		"broker": "homeassistant",
+		"port": 1883,
+		"user": "truck",
+		"pass": "truck"
+	},
+	"wifi": {
+		"prefix": "Waldon_"
+	},
+	"paths": {
+		"dashcam_mount": "/mnt/dashcam",
+		"ram_disk": "/dev/shm"
+	}
+}

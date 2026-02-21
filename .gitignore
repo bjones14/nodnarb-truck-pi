@@ -1,20 +1,32 @@
-# Ignore python cache
+#  Ignore EVERYTHING in the home directory by default
+
+/*
+
+# Explicitly ALLOW (un-ignore) your truck project files
+
+!dashcam.py
+!telemetry.py
+!config.json
+!.gitignore
+!README.md
+!telemetry.service
+!dashcam.service
+
+# Explicitly allow the .git folder (required for git to work)
+
+!.git/
+
+# Ensure these sensitive/large files stay ignored even if matched above
 
 pycache/
 *.pyc
-
-# Ignore local secrets
-
-config.json
-
-# Ignore video assets and streams
-
-/dev/shm/*
 *.mp4
 *.srt
 *.ts
 *.m3u8
-
-# Ignore system logs
-
-*.log
+.bash_history
+.python_history
+.ssh/
+.cache/
+.config/
+.local/
