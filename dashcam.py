@@ -5,7 +5,6 @@ import datetime
 import subprocess
 import psutil
 import json
-import paho.mqtt.client as mqtt
 from flask import Flask, send_from_directory
 
 app = Flask(__name__)
@@ -27,67 +26,36 @@ MAX_DISK_USAGE_PERCENT = 90
 CHUNK_SECONDS = 300
 STATUS_TOPIC = "truck/dashcam/status"
 
+# --- IMAGE QUALITY TUNING ---
+# These flags help with overexposure at night.
+# We reduce brightness and increase contrast to keep light sources from 'blooming'.
+VIDEO_PARAMS = [
+    "-vf", "eq=brightness=-0.1:contrast=1.2:saturation=1.1",
+]
+
 # Global State
 garage_mode_active = False
 
-def report_status(msg):
-    """Pushes mode changes to MQTT using a background thread."""
-    def _do_report():
-        try:
-            client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
-            client.username_pw_set(MQTT_USER, MQTT_PASS)
-            client.connect(BROKER_IP, 1883, 5)
-            client.publish(STATUS_TOPIC, msg, retain=True)
-            client.disconnect()
-        except: pass
-    threading.Thread(target=_do_report, daemon=True).start()
-
 def check_wifi_geofence():
-    """Polls for home networks every 60s to minimize CPU impact."""
+    """Polls for home networks every 60s."""
     global garage_mode_active
     while True:
         try:
             cmd = "nmcli -t -f ACTIVE,SSID dev wifi | grep '^yes' | cut -d':' -f2"
             current_ssid = subprocess.check_output(cmd, shell=True, encoding='utf-8').strip()
-
             is_home = current_ssid.startswith(WIFI_PREFIX)
-
-            if is_home and not garage_mode_active:
-                garage_mode_active = True
-                report_status(f"Garage Mode: {current_ssid}")
-            elif not is_home and garage_mode_active:
-                garage_mode_active = False
-                report_status("Road Mode: Recording Enabled")
+            if is_home != garage_mode_active:
+                garage_mode_active = is_home
         except:
-            if garage_mode_active:
-                garage_mode_active = False
+            pass
         time.sleep(60)
 
 threading.Thread(target=check_wifi_geofence, daemon=True).start()
 
-def disk_cleaner():
-    """Cleanup old clips every 10 mins."""
-    while True:
-        try:
-            stat = os.statvfs(DISK_PATH)
-            percent_used = 100 * (1 - (stat.f_bavail / stat.f_blocks))
-            while percent_used > MAX_DISK_USAGE_PERCENT:
-                files = [os.path.join(DISK_PATH, f) for f in os.listdir(DISK_PATH) if f.endswith(('.mp4', '.srt'))]
-                if not files: break
-                oldest_file = min(files, key=os.path.getctime)
-                base_name = os.path.splitext(oldest_file)[0]
-                for ext in ['.mp4', '.srt']:
-                    f = base_name + ext
-                    if os.path.exists(f): os.remove(f)
-                stat = os.statvfs(DISK_PATH)
-                percent_used = 100 * (1 - (stat.f_bavail / stat.f_blocks))
-        except: pass
-        time.sleep(600)
-
 def record_loop():
-    """Manages the FFmpeg process with low-frequency polling."""
+    """Manages FFmpeg with corruption-resistant flags and image tuning."""
     for f in os.listdir(RAM_DISK):
-        if f.startswith('stream') and (f.endswith('.m3u8') or f.endswith('.ts')):
+        if f.startswith('stream') or f.endswith('.tmp_srt'):
             try: os.remove(os.path.join(RAM_DISK, f))
             except: pass
 
@@ -95,72 +63,72 @@ def record_loop():
         if garage_mode_active:
             ffmpeg_cmd = [
                 "ffmpeg", "-y", "-f", "v4l2", "-input_format", "h264", "-video_size", "1920x1080", "-framerate", "30",
-                "-i", "/dev/video0",
-                "-c:v", "copy", "-f", "hls", "-hls_time", "2", "-hls_list_size", "5", "-hls_flags", "delete_segments",
-                os.path.join(RAM_DISK, "stream.m3u8")
+                "-i", "/dev/video0", "-c:v", "copy", "-f", "hls", "-hls_time", "2", "-hls_list_size", "5",
+                "-hls_flags", "delete_segments", os.path.join(RAM_DISK, "stream.m3u8")
             ]
         else:
             ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            base_filename = os.path.join(DISK_PATH, f"SilverADO_{ts}")
-            mp4_file = f"{base_filename}.mp4"
-            srt_file = f"{base_filename}.srt"
+            mp4_file = os.path.join(DISK_PATH, f"SilverADO_{ts}.mp4")
+            tmp_srt = os.path.join(RAM_DISK, f"SilverADO_{ts}.tmp_srt")
+            final_srt = os.path.join(DISK_PATH, f"SilverADO_{ts}.srt")
 
             ffmpeg_cmd = [
                 "ffmpeg", "-y", "-f", "v4l2", "-input_format", "h264", "-video_size", "1920x1080", "-framerate", "30",
-                "-t", str(CHUNK_SECONDS), "-i", "/dev/video0",
-                "-c:v", "copy", mp4_file,
-                "-c:v", "copy", "-f", "hls", "-hls_time", "2", "-hls_list_size", "5", "-hls_flags", "delete_segments",
-                os.path.join(RAM_DISK, "stream.m3u8")
+                "-i", "/dev/video0",
+                "-t", str(CHUNK_SECONDS),
+                # Apply Image Correction filters
+                "-vf", "eq=brightness=-0.05:contrast=1.3",
+                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "25",
+                "-movflags", "+frag_keyframe+empty_moov+omit_tfhd_offset+default_base_moof",
+                mp4_file,
+                "-c:v", "copy", "-f", "hls", "-hls_time", "2", "-hls_list_size", "5",
+                "-hls_flags", "delete_segments", os.path.join(RAM_DISK, "stream.m3u8")
             ]
-            threading.Thread(target=generate_srt, args=(srt_file,), daemon=True).start()
+            threading.Thread(target=generate_srt, args=(tmp_srt,), daemon=True).start()
 
         process = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
         while process.poll() is None:
-            # Check for mode mismatch
-            is_cmd_recording = ("mp4" in str(ffmpeg_cmd))
-            if garage_mode_active == is_cmd_recording:
+            if garage_mode_active == ("mp4" in str(ffmpeg_cmd)):
                 process.terminate()
                 break
             time.sleep(10)
 
         process.wait()
 
+        if not garage_mode_active and os.path.exists(tmp_srt):
+            try:
+                with open(tmp_srt, 'r') as fr, open(final_srt, 'w') as fw:
+                    fw.write(fr.read())
+                os.remove(tmp_srt)
+            except: pass
+
 def generate_srt(srt_file):
-    """Generates telemetry subtitles with non-blocking CPU calls."""
     srt_index = 1
     start_time = time.time()
-    psutil.cpu_percent(interval=None) 
-
+    psutil.cpu_percent(interval=None)
     try:
         with open(srt_file, "w") as f:
             while srt_index <= CHUNK_SECONDS and not garage_mode_active:
                 elapsed = time.time() - start_time
-                current_time_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 cpu = psutil.cpu_percent(interval=None)
-
                 start_ts = str(datetime.timedelta(seconds=int(elapsed))) + ",000"
                 end_ts = str(datetime.timedelta(seconds=int(elapsed + 1))) + ",000"
-
                 f.write(f"{srt_index}\n{start_ts} --> {end_ts}\n")
-                f.write(f"SILVERADO | {current_time_str} | CPU: {cpu}% | MODE: ROAD\n\n")
+                f.write(f"SILVERADO | {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | CPU: {cpu}% | MODE: ROAD\n\n")
                 f.flush()
-
                 srt_index += 1
                 time.sleep(1.0)
     except: pass
 
 @app.route('/stream.m3u8')
-def stream_m3u8():
-    return send_from_directory(RAM_DISK, 'stream.m3u8')
+def stream_m3u8(): return send_from_directory(RAM_DISK, 'stream.m3u8')
 
 @app.route('/<path:filename>')
 def stream_ts(filename):
-    if filename.endswith('.ts'):
-        return send_from_directory(RAM_DISK, filename)
+    if filename.endswith('.ts'): return send_from_directory(RAM_DISK, filename)
     return "Not found", 404
 
 if __name__ == "__main__":
-    threading.Thread(target=disk_cleaner, daemon=True).start()
     threading.Thread(target=record_loop, daemon=True).start()
     app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False, threaded=True)
