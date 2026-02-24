@@ -52,45 +52,50 @@ BASE_TOPIC = "truck/pi"
 
 # --- CALIBRATION ---
 DIVIDER_FACTOR = 5.545
-VOLT_CRITICAL_HALT = 11.5    # Lowered from 11.9 to prevent nuisance shutdowns
+VOLT_CRITICAL_HALT = 11.2
+VOLT_LOW_WARNING = 11.8
 AWAKE_THRESHOLD_V = 9.0
-CURRENT_ZERO_VOLTAGE = 1.25
-CURRENT_SENSITIVITY_V_PER_A = 0.033
 
-# --- HARDWARE SETUP ---
-ARGON_FAN_ADDR = 0x1a
+# CURRENT SENSOR CALIBRATION (Absolute Hardware Zero)
+# Updated to 0.5847V based on image_8c502f.png (sensor disconnected)
+CURRENT_ZERO_VOLTAGE = 0.5847
+CURRENT_SENSITIVITY_V_PER_A = 0.033
+AMP_CRANK_THRESHOLD = 40.0
+
+# --- HARDWARE SETUP (Pins 14, 16, 18) ---
 W1_DEVICE_BASE = '/sys/bus/w1/devices/'
+W1_DATA_GPIO = 23
+W1_POWER_GPIO = 24
+ARGON_FAN_ADDR = 0x1a
 
 # --- GLOBAL STATE ---
 i2c_bus = None
 chan_f12_constant = None
 chan_f26_switched = None
 chan_current_sensor = None
-low_volt_counter = 0  # Counter for "Grace Period" logic
+low_volt_counter = 0
 
-def init_hardware():
-    global i2c_bus, chan_f12_constant, chan_f26_switched, chan_current_sensor
-    if board and busio:
-        try:
-            i2c_bus = busio.I2C(board.SCL, board.SDA)
-            if ADS:
-                ads = ADS.ADS1115(i2c_bus)
-                chan_f12_constant = AnalogIn(ads, 0)
-                chan_f26_switched = AnalogIn(ads, 1)
-                chan_current_sensor = AnalogIn(ads, 2)
-        except Exception:
-            pass
-
+def hard_reset_1wire():
+    """Toggles GPIO power and reloads modules to clear sensor latch-up."""
     try:
-        subprocess.run(['sudo', 'modprobe', 'w1-gpio'], check=False)
-        subprocess.run(['sudo', 'modprobe', 'w1-therm'], check=False)
-    except:
-        pass
+        subprocess.run(['sudo', 'modprobe', '-r', 'w1-therm'], capture_output=True)
+        subprocess.run(['sudo', 'modprobe', '-r', 'w1-gpio'], capture_output=True)
+        # Cycle power on Pin 18
+        subprocess.run(['sudo', 'pinctrl', 'set', str(W1_POWER_GPIO), 'op', 'dl'], capture_output=True)
+        time.sleep(2)
+        subprocess.run(['sudo', 'pinctrl', 'set', str(W1_POWER_GPIO), 'op', 'dh'], capture_output=True)
+        time.sleep(1)
+        subprocess.run(['sudo', 'modprobe', 'w1-gpio'], capture_output=True)
+        subprocess.run(['sudo', 'modprobe', 'w1-therm'], capture_output=True)
+        time.sleep(2)
+    except Exception: pass
 
 def get_cabin_temp():
     try:
         device_folders = glob.glob(W1_DEVICE_BASE + '28*')
-        if not device_folders: return None
+        if not device_folders:
+            hard_reset_1wire()
+            return None
         device_file = device_folders[0] + '/w1_slave'
         if not os.path.exists(device_file): return None
         with open(device_file, 'r') as f:
@@ -100,8 +105,42 @@ def get_cabin_temp():
         if equals_pos != -1:
             temp_string = lines[1][equals_pos+2:]
             return round(float(temp_string) / 1000.0, 1)
-    except: pass
+    except Exception: pass
     return None
+
+def init_hardware():
+    global i2c_bus, chan_f12_constant, chan_f26_switched, chan_current_sensor
+    # Ensure Pin 18 is providing 3.3V for the DS18B20 sensor
+    subprocess.run(['sudo', 'pinctrl', 'set', str(W1_POWER_GPIO), 'op', 'dh'], capture_output=True)
+
+    if board and busio:
+        try:
+            i2c_bus = busio.I2C(board.SCL, board.SDA)
+            if ADS:
+                ads = ADS.ADS1115(i2c_bus)
+                chan_f12_constant = AnalogIn(ads, 0)
+                chan_f26_switched = AnalogIn(ads, 1)
+                chan_current_sensor = AnalogIn(ads, 2)
+        except Exception: pass
+    hard_reset_1wire()
+
+def get_voltage(channel, apply_divider=True):
+    if channel:
+        try:
+            raw_v = channel.voltage
+            return round(raw_v * DIVIDER_FACTOR, 2) if apply_divider else raw_v
+        except: pass
+    return 0.0
+
+def get_current_amps():
+    if chan_current_sensor:
+        try:
+            sensor_v = get_voltage(chan_current_sensor, apply_divider=False)
+            # Amps = (Observed - Zero) / Sensitivity
+            amps = (sensor_v - CURRENT_ZERO_VOLTAGE) / CURRENT_SENSITIVITY_V_PER_A
+            return round(amps, 2)
+        except: pass
+    return 0.0
 
 def set_argon_fan_speed(speed):
     if i2c_bus:
@@ -121,23 +160,6 @@ def get_fan_curve_speed(temp_c):
     if temp_c < 65: return 55
     if temp_c < 70: return 80
     return 100
-
-def get_voltage(channel, apply_divider=True):
-    if channel:
-        try:
-            raw_v = channel.voltage
-            return round(raw_v * DIVIDER_FACTOR, 2) if apply_divider else raw_v
-        except: pass
-    return 0.0
-
-def get_current_amps():
-    if chan_current_sensor:
-        try:
-            sensor_v = get_voltage(chan_current_sensor, apply_divider=False)
-            amps = (sensor_v - CURRENT_ZERO_VOLTAGE) / CURRENT_SENSITIVITY_V_PER_A
-            return round(amps, 2)
-        except: pass
-    return 0.0
 
 def get_cpu_temp():
     try:
@@ -159,7 +181,7 @@ def publish_ha_discovery(client):
     sensors = [
         {"id": "batt_v", "name": "Main Battery", "cmp": "sensor", "cls": "voltage", "unit": "V", "tpl": "{{ value_json.battery_voltage }}"},
         {"id": "ign_v", "name": "Ignition Signal", "cmp": "sensor", "cls": "voltage", "unit": "V", "tpl": "{{ value_json.ign_voltage }}"},
-        {"id": "curr", "name": "Battery Draw", "cmp": "sensor", "cls": "current", "unit": "A", "tpl": "{{ value_json.current_amps }}"},
+        {"id": "curr", "name": "Battery Current", "cmp": "sensor", "cls": "current", "unit": "A", "tpl": "{{ value_json.current_amps }}"},
         {"id": "cabin_t", "name": "Truck Cabin Temp", "cmp": "sensor", "cls": "temperature", "unit": "°C", "tpl": "{{ value_json.cabin_temp_c }}"},
         {"id": "cpu_t", "name": "Pi CPU Temp", "cmp": "sensor", "cls": "temperature", "unit": "°C", "tpl": "{{ value_json.cpu_temp_c }}"},
         {"id": "fan_s", "name": "Argon Fan Speed", "cmp": "sensor", "unit": "%", "tpl": "{{ value_json.fan_speed_pct }}", "icon": "mdi:fan"},
@@ -180,6 +202,8 @@ def main():
     try: client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
     except (AttributeError, TypeError): client = mqtt.Client()
     client.username_pw_set(MQTT_USER, MQTT_PASS)
+    client.will_set(f"{BASE_TOPIC}/status", "Offline", retain=True)
+
     connected = False
     while not connected:
         try:
@@ -200,19 +224,18 @@ def main():
             amps = get_current_amps()
             cabin_t = get_cabin_temp()
             pwr_status = get_power_status()
-            is_awake = ign_v > AWAKE_THRESHOLD_V
 
-            # --- SMART BATTERY PROTECTION ---
-            # If voltage is critically low, increment counter.
-            # Needs 3 consecutive "Low" readings to trigger halt.
+            # Adjusted ignition logic to handle ADC noise offset
+            is_awake = ign_v > AWAKE_THRESHOLD_V
+            is_cranking = abs(amps) > AMP_CRANK_THRESHOLD
+
             if 0.5 < main_v < VOLT_CRITICAL_HALT:
-                low_volt_counter += 1
-                if low_volt_counter >= 3:
-                    client.publish(f"{BASE_TOPIC}/status", f"CRITICAL VOLT {main_v}V: HALTING", retain=True)
+                if not is_cranking: low_volt_counter += 1
+                if low_volt_counter >= 5:
+                    client.publish(f"{BASE_TOPIC}/status", f"HALTING: {main_v}V", retain=True)
                     time.sleep(2)
                     os.system("sudo halt")
-            else:
-                low_volt_counter = 0 # Reset if voltage recovers
+            else: low_volt_counter = 0
 
             if is_awake != last_awake_state:
                 os.system(f"sudo systemctl {'start' if is_awake else 'stop'} dashcam.service")
@@ -231,8 +254,9 @@ def main():
                 "cpu_usage_pct": psutil.cpu_percent() if psutil else 0
             }
             client.publish(f"{BASE_TOPIC}/system", json.dumps(payload), qos=1)
-            time.sleep(5 if is_awake else 60)
+            time.sleep(10 if is_awake else 60)
         except Exception: time.sleep(10)
 
 if __name__ == "__main__":
     main()
+
