@@ -23,15 +23,9 @@ MQTT_USER = config['mqtt']['user']
 MQTT_PASS = config['mqtt']['pass']
 
 MAX_DISK_USAGE_PERCENT = 90
-CHUNK_SECONDS = 300
+# Reduced to 2 minutes for safer memory management and easier file handling
+CHUNK_SECONDS = 120
 STATUS_TOPIC = "truck/dashcam/status"
-
-# --- IMAGE QUALITY TUNING ---
-# These flags help with overexposure at night.
-# We reduce brightness and increase contrast to keep light sources from 'blooming'.
-VIDEO_PARAMS = [
-    "-vf", "eq=brightness=-0.1:contrast=1.2:saturation=1.1",
-]
 
 # Global State
 garage_mode_active = False
@@ -53,7 +47,7 @@ def check_wifi_geofence():
 threading.Thread(target=check_wifi_geofence, daemon=True).start()
 
 def record_loop():
-    """Manages FFmpeg with corruption-resistant flags and image tuning."""
+    """Manages FFmpeg with direct stream copy for low CPU and small file sizes."""
     for f in os.listdir(RAM_DISK):
         if f.startswith('stream') or f.endswith('.tmp_srt'):
             try: os.remove(os.path.join(RAM_DISK, f))
@@ -72,13 +66,14 @@ def record_loop():
             tmp_srt = os.path.join(RAM_DISK, f"SilverADO_{ts}.tmp_srt")
             final_srt = os.path.join(DISK_PATH, f"SilverADO_{ts}.srt")
 
+            # Optimized FFmpeg command.
+            # Removed the software video filter (-vf) and libx264.
+            # Replaced with direct stream copy (-c:v copy).
             ffmpeg_cmd = [
                 "ffmpeg", "-y", "-f", "v4l2", "-input_format", "h264", "-video_size", "1920x1080", "-framerate", "30",
                 "-i", "/dev/video0",
                 "-t", str(CHUNK_SECONDS),
-                # Apply Image Correction filters
-                "-vf", "eq=brightness=-0.05:contrast=1.3",
-                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "25",
+                "-c:v", "copy", 
                 "-movflags", "+frag_keyframe+empty_moov+omit_tfhd_offset+default_base_moof",
                 mp4_file,
                 "-c:v", "copy", "-f", "hls", "-hls_time", "2", "-hls_list_size", "5",
@@ -102,6 +97,10 @@ def record_loop():
                     fw.write(fr.read())
                 os.remove(tmp_srt)
             except: pass
+
+        # Give the Linux kernel 2 seconds to release the /dev/video0 interface before looping.
+        # This prevents the "Device Busy" crash that was killing your recordings after the first chunk!
+        time.sleep(2)
 
 def generate_srt(srt_file):
     srt_index = 1
@@ -132,3 +131,4 @@ def stream_ts(filename):
 if __name__ == "__main__":
     threading.Thread(target=record_loop, daemon=True).start()
     app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False, threaded=True)
+
