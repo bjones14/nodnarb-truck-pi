@@ -119,7 +119,7 @@ def record_loop():
         if garage_mode_active:
             # GARAGE MODE: HLS STREAM ONLY (Infinite)
             ffmpeg_cmd = [
-                "ffmpeg", "-hide_banner", "-loglevel", "warning", "-nostdin", "-y",
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
                 "-use_wallclock_as_timestamps", "1", "-fflags", "+genpts",
                 "-f", "v4l2", "-input_format", "h264", "-video_size", "1920x1080", "-framerate", "30",
                 "-thread_queue_size", "4096",
@@ -142,9 +142,8 @@ def record_loop():
 
             print(f"[{now.strftime('%H:%M:%S')}] [RECORDING] Start: Silverado_{ts}.mp4 ({CHUNK_SECONDS}s)")
 
-            # Added -use_wallclock_as_timestamps 1 and -fflags +genpts to fix cheap webcam clock bugs
             ffmpeg_cmd = [
-                "ffmpeg", "-hide_banner", "-loglevel", "warning", "-nostdin", "-y",
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
                 "-use_wallclock_as_timestamps", "1", "-fflags", "+genpts",
                 "-f", "v4l2", "-input_format", "h264", "-video_size", "1920x1080", "-framerate", "30",
                 "-t", str(CHUNK_SECONDS),
@@ -162,17 +161,14 @@ def record_loop():
             threading.Thread(target=generate_srt, args=(final_srt,), daemon=True).start()
 
         try:
-            # We keep DEVNULL off stdout, but leave stderr default so warnings pass to console
             process = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.DEVNULL)
 
             while process.poll() is None:
-                # Mode change detection
                 if garage_mode_active == ("mp4" in str(ffmpeg_cmd)):
                     print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [SYSTEM] Mode changed, terminating process.")
                     process.terminate()
                     break
 
-                # Hardware check
                 if not is_camera_present():
                     print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [CRITICAL] Camera disconnected.")
                     process.terminate()
@@ -188,22 +184,50 @@ def record_loop():
         print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [SYSTEM] Chunk finished.")
         time.sleep(HW_BUFFER_SECONDS)
 
+def get_telemetry():
+    """Reads live vehicle sensors shared by telemetry.py via RAM disk."""
+    try:
+        with open("/dev/shm/telemetry.json", "r") as f:
+            data = json.load(f)
+
+        # Temperature (Convert C to F if valid, otherwise fallback to N/A)
+        cabin_c = data.get("cabin_temp_c")
+        if cabin_c is not None:
+            temp_str = f"{(cabin_c * 9/5) + 32:.0f}F"
+        else:
+            temp_str = "N/A"
+
+        # Voltage & Current (Formatted to 1 decimal place)
+        volts_str = f"{data.get('battery_voltage', 0.0):.1f}"
+        amps_str = f"{data.get('current_amps', 0.0):.1f}"
+
+        return temp_str, volts_str, amps_str
+    except Exception:
+        # If telemetry.py isn't running or file is missing, return placeholders
+        return "N/A", "--.-", "--.-"
+
 def generate_srt(srt_file):
     """Generates a synchronous subtitle file with live telemetry data."""
     srt_index = 1
     start_time = time.monotonic()
     try:
         with open(srt_file, "w") as f:
-            # Keep subtitle thread alive only as long as we are in the same mode and chunk
             current_mode = garage_mode_active
             while srt_index <= CHUNK_SECONDS and garage_mode_active == current_mode:
                 if not is_camera_present(): break
                 elapsed = time.monotonic() - start_time
                 cpu = psutil.cpu_percent(interval=None)
+
                 start_ts = str(datetime.timedelta(seconds=int(elapsed))) + ",000"
                 end_ts = str(datetime.timedelta(seconds=int(elapsed + 1))) + ",000"
+
+                # Format: YY-MM-DD HH:MM:SS AM/PM
+                timestamp_str = datetime.datetime.now().strftime('%y-%m-%d %I:%M:%S %p')
+                temp, volts, amps = get_telemetry()
+
                 f.write(f"{srt_index}\n{start_ts} --> {end_ts}\n")
-                f.write(f"Silverado | {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | CPU: {cpu}% | MODE: ROAD\n\n")
+                f.write(f"{timestamp_str} | CPU: {cpu}% | Temp: {temp} | Bat: {volts}V {amps}A\n\n")
+
                 f.flush()
                 os.fsync(f.fileno())
                 srt_index += 1

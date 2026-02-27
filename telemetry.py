@@ -288,6 +288,20 @@ def main():
                 "cpu_usage_pct": psutil.cpu_percent() if psutil else 0
             }
 
+            # --- NEW: RAM Disk IPC for Dashcam ---
+            try:
+                # We write to a .tmp file first, then rename it to .json.
+                # In Linux, renaming a file is "Atomic" (instant), meaning the dashcam
+                # will never accidentally read a corrupted, half-written JSON file!
+                tmp_file = "/dev/shm/telemetry.tmp"
+                final_file = "/dev/shm/telemetry.json"
+                with open(tmp_file, "w") as f:
+                    json.dump(payload, f)
+                os.rename(tmp_file, final_file)
+            except Exception:
+                pass
+            # -------------------------------------
+
             # FIX 3: Print the output so we can see what's failing in journalctl
             client.publish(f"{BASE_TOPIC}/system", json.dumps(payload), qos=1)
             print(f"[{time.strftime('%H:%M:%S')}] Published MQTT Payload: {payload}", flush=True)
