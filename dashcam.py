@@ -14,8 +14,8 @@ app = Flask(__name__)
 # --- PARSE COMMAND LINE ARGS ---
 parser = argparse.ArgumentParser(description="Silverado Dashcam Service")
 parser.add_argument('--ignore-parked', action='store_true', help="Force continuous MP4 recording to disk, ignoring WiFi.")
-parser.add_argument('--chunk-seconds', type=int, default=900, help="Duration of each video chunk in seconds (default: 900).")
-parser.add_argument('--hw-buffer', type=int, default=2, help="Hardware release buffer time in seconds (default: 2).")
+parser.add_argument('--chunk-seconds', type=int, default=2700, help="Duration of video chunk in seconds.")
+parser.add_argument('--hw-buffer', type=int, default=2, help="Hardware release buffer time in seconds.")
 args, unknown = parser.parse_known_args()
 
 IGNORE_PARKED = args.ignore_parked
@@ -28,7 +28,6 @@ try:
     with open(CONFIG_PATH, 'r') as f:
         config = json.load(f)
 except Exception:
-    # Fallback defaults if config is missing during testing
     config = {
         "paths": {"dashcam_mount": "/mnt/dashcam", "ram_disk": "/mnt/ramdisk"},
         "wifi": {"prefix": "Silverado_Guest"}
@@ -37,7 +36,7 @@ except Exception:
 # --- CONFIGURATION FROM FILE ---
 DISK_PATH = config['paths']['dashcam_mount']
 RAM_DISK = config['paths']['ram_disk']
-WIFI_PREFIX = config['wifi']['prefix']
+WIFI_PREFIX = config['wifi'].get('prefix', 'Silverado_Guest')
 
 MAX_DISK_USAGE_PERCENT = 90
 
@@ -60,104 +59,125 @@ def check_wifi_geofence():
             is_home = current_ssid.startswith(WIFI_PREFIX)
 
             if is_home != garage_mode_active:
-                print(f"[STATUS] Network Change: {'Garage' if is_home else 'Road'} Mode")
+                print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [MODE] Switching to {'GARAGE' if is_home else 'ROAD'} Mode")
                 garage_mode_active = is_home
         except Exception:
             pass
-
         time.sleep(60)
 
 threading.Thread(target=check_wifi_geofence, daemon=True).start()
 
-def is_camera_ready():
-    """Verifies that the camera device exists and is available."""
+def is_camera_present():
+    """Checks if the camera hardware is physically connected."""
     return os.path.exists("/dev/video0")
+
+def cleanup_ram_disk():
+    """Cleans up the RAM disk and loudly alerts if there are permission issues (root vs user)."""
+    if os.path.exists(RAM_DISK):
+        for f in os.listdir(RAM_DISK):
+            if f.startswith('stream') or f.endswith('.tmp_srt'):
+                file_path = os.path.join(RAM_DISK, f)
+                try:
+                    os.remove(file_path)
+                except PermissionError:
+                    print(f"[CRITICAL] Cannot delete {file_path}!")
+                    print(f"           Permission Denied. Was it created by root/sudo?")
+                    print(f"           Run this manually: sudo rm -f {file_path}")
+                except Exception:
+                    pass
 
 def cleanup_old_footage():
     """Checks disk usage and deletes the oldest date folder if over the limit."""
     try:
-        # Check usage of the partition where DISK_PATH is mounted
         usage = psutil.disk_usage(DISK_PATH)
         if usage.percent > MAX_DISK_USAGE_PERCENT:
-            print(f"[STORAGE] Disk usage at {usage.percent}%. Threshold is {MAX_DISK_USAGE_PERCENT}%.")
-
-            # Get list of folders (named YYYY-MM-DD)
-            # Sorting alphabetically works perfectly for date-based folder names
             all_entries = os.listdir(DISK_PATH)
             folders = sorted([f for f in all_entries if os.path.isdir(os.path.join(DISK_PATH, f))])
-
             if folders:
                 oldest_folder = os.path.join(DISK_PATH, folders[0])
-                print(f"[STORAGE] Purging oldest footage folder: {oldest_folder}")
+                print(f"[STORAGE] Disk at {usage.percent}%. Purging: {oldest_folder}")
                 shutil.rmtree(oldest_folder)
-            else:
-                print("[STORAGE] Warning: Disk is full but no daily folders were found to delete.")
-    except Exception as e:
-        print(f"[STORAGE] Error during disk cleanup: {e}")
+    except Exception: pass
 
 def record_loop():
-    """Manages FFmpeg with improved hardware availability and pipe management."""
-    # Clean up RAM disk on startup
-    if os.path.exists(RAM_DISK):
-        for f in os.listdir(RAM_DISK):
-            if f.startswith('stream') or f.endswith('.tmp_srt'):
-                try:
-                    os.remove(os.path.join(RAM_DISK, f))
-                except Exception:
-                    pass
+    """Manages FFmpeg with massive buffering for thumb drive latency."""
+    print(f"--- DASHCAM STARTUP ---")
+    print(f"Target Duration: {CHUNK_SECONDS}s")
+    print(f"Ignore Parked: {IGNORE_PARKED}")
+    print(f"-----------------------")
+
+    cleanup_ram_disk()
 
     while True:
-        # Wait for the hardware to be present before starting
-        while not is_camera_ready():
-            print("[HARDWARE] Camera missing. Retrying in 5s...")
-            time.sleep(5.0)
+        # Wait for camera hardware
+        if not is_camera_present():
+            print("[HARDWARE] Camera /dev/video0 NOT FOUND. Checking again in 5s...")
+            while not is_camera_present():
+                time.sleep(5.0)
+            print("[HARDWARE] Camera reconnected!")
 
         if garage_mode_active:
+            # GARAGE MODE: HLS STREAM ONLY (Infinite)
             ffmpeg_cmd = [
-                "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+                "ffmpeg", "-hide_banner", "-loglevel", "warning", "-nostdin", "-y",
+                "-use_wallclock_as_timestamps", "1", "-fflags", "+genpts",
                 "-f", "v4l2", "-input_format", "h264", "-video_size", "1920x1080", "-framerate", "30",
-                "-i", "/dev/video0", "-c:v", "copy", "-f", "hls", "-hls_time", "2", "-hls_list_size", "5",
+                "-thread_queue_size", "4096",
+                "-i", "/dev/video0",
+                "-c:v", "copy",
+                "-max_muxing_queue_size", "9999",
+                "-f", "hls", "-hls_time", "2", "-hls_list_size", "5",
                 "-hls_flags", "delete_segments", os.path.join(RAM_DISK, "stream.m3u8")
             ]
         else:
-            # Check and clean disk space before starting a new Road Mode chunk
+            # ROAD MODE: MP4 + HLS (Limited by CHUNK_SECONDS)
             cleanup_old_footage()
-
             now = datetime.datetime.now()
-            date_folder = now.strftime("%Y-%m-%d")
-            ts = now.strftime("%Y%m%d_%H%M%S")
-
-            daily_path = os.path.join(DISK_PATH, date_folder)
+            daily_path = os.path.join(DISK_PATH, now.strftime("%Y-%m-%d"))
             os.makedirs(daily_path, exist_ok=True)
 
+            ts = now.strftime("%Y%m%d_%H%M%S")
             mp4_file = os.path.join(daily_path, f"Silverado_{ts}.mp4")
             final_srt = os.path.join(daily_path, f"Silverado_{ts}.srt")
 
-            print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [RECORDING] Starting chunk: Silverado_{ts}.mp4")
+            print(f"[{now.strftime('%H:%M:%S')}] [RECORDING] Start: Silverado_{ts}.mp4 ({CHUNK_SECONDS}s)")
 
-            # Applying -t to the INPUT ensures all outputs (MP4 and HLS) stop at the same time
+            # Added -use_wallclock_as_timestamps 1 and -fflags +genpts to fix cheap webcam clock bugs
             ffmpeg_cmd = [
-                "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+                "ffmpeg", "-hide_banner", "-loglevel", "warning", "-nostdin", "-y",
+                "-use_wallclock_as_timestamps", "1", "-fflags", "+genpts",
                 "-f", "v4l2", "-input_format", "h264", "-video_size", "1920x1080", "-framerate", "30",
                 "-t", str(CHUNK_SECONDS),
+                "-thread_queue_size", "4096",
                 "-i", "/dev/video0",
                 "-c:v", "copy",
+                "-max_muxing_queue_size", "9999",
                 "-movflags", "+frag_keyframe+empty_moov+omit_tfhd_offset+default_base_moof",
-                "-flush_packets", "1",
                 mp4_file,
-                "-c:v", "copy", "-f", "hls", "-hls_time", "2", "-hls_list_size", "5",
+                "-c:v", "copy",
+                "-max_muxing_queue_size", "9999",
+                "-f", "hls", "-hls_time", "2", "-hls_list_size", "5",
                 "-hls_flags", "delete_segments", os.path.join(RAM_DISK, "stream.m3u8")
             ]
-
             threading.Thread(target=generate_srt, args=(final_srt,), daemon=True).start()
 
         try:
-            process = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            # We keep DEVNULL off stdout, but leave stderr default so warnings pass to console
+            process = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.DEVNULL)
 
             while process.poll() is None:
+                # Mode change detection
                 if garage_mode_active == ("mp4" in str(ffmpeg_cmd)):
+                    print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [SYSTEM] Mode changed, terminating process.")
                     process.terminate()
                     break
+
+                # Hardware check
+                if not is_camera_present():
+                    print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [CRITICAL] Camera disconnected.")
+                    process.terminate()
+                    break
+
                 time.sleep(2)
 
             process.wait()
@@ -165,34 +185,30 @@ def record_loop():
         except Exception as e:
             print(f"[CRITICAL] Loop error: {e}")
 
-        print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [SYSTEM] Chunk finished. Pausing {HW_BUFFER_SECONDS}s for HW release...")
+        print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [SYSTEM] Chunk finished.")
         time.sleep(HW_BUFFER_SECONDS)
 
 def generate_srt(srt_file):
     """Generates a synchronous subtitle file with live telemetry data."""
     srt_index = 1
     start_time = time.monotonic()
-    psutil.cpu_percent(interval=None)
-
     try:
         with open(srt_file, "w") as f:
-            while srt_index <= CHUNK_SECONDS and not garage_mode_active:
+            # Keep subtitle thread alive only as long as we are in the same mode and chunk
+            current_mode = garage_mode_active
+            while srt_index <= CHUNK_SECONDS and garage_mode_active == current_mode:
+                if not is_camera_present(): break
                 elapsed = time.monotonic() - start_time
                 cpu = psutil.cpu_percent(interval=None)
-
                 start_ts = str(datetime.timedelta(seconds=int(elapsed))) + ",000"
                 end_ts = str(datetime.timedelta(seconds=int(elapsed + 1))) + ",000"
-
                 f.write(f"{srt_index}\n{start_ts} --> {end_ts}\n")
                 f.write(f"Silverado | {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | CPU: {cpu}% | MODE: ROAD\n\n")
-
                 f.flush()
                 os.fsync(f.fileno())
-
                 srt_index += 1
                 time.sleep(1.0)
-    except Exception:
-        pass
+    except Exception: pass
 
 @app.route('/stream.m3u8')
 def stream_m3u8():
