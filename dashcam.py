@@ -23,8 +23,8 @@ MQTT_USER = config['mqtt']['user']
 MQTT_PASS = config['mqtt']['pass']
 
 MAX_DISK_USAGE_PERCENT = 90
-# Reduced to 2 minutes for safer memory management and easier file handling
-CHUNK_SECONDS = 120
+# FIX 1: Increased to 15 minutes (900 seconds) for better organization
+CHUNK_SECONDS = 900
 STATUS_TOPIC = "truck/dashcam/status"
 
 # Global State
@@ -63,23 +63,25 @@ def record_loop():
         else:
             ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
             mp4_file = os.path.join(DISK_PATH, f"SilverADO_{ts}.mp4")
-            tmp_srt = os.path.join(RAM_DISK, f"SilverADO_{ts}.tmp_srt")
             final_srt = os.path.join(DISK_PATH, f"SilverADO_{ts}.srt")
 
-            # Optimized FFmpeg command.
+            # FIX 2: Optimized FFmpeg command.
             # Removed the software video filter (-vf) and libx264.
             # Replaced with direct stream copy (-c:v copy).
             ffmpeg_cmd = [
                 "ffmpeg", "-y", "-f", "v4l2", "-input_format", "h264", "-video_size", "1920x1080", "-framerate", "30",
                 "-i", "/dev/video0",
                 "-t", str(CHUNK_SECONDS),
-                "-c:v", "copy", 
+                "-c:v", "copy",
                 "-movflags", "+frag_keyframe+empty_moov+omit_tfhd_offset+default_base_moof",
+                "-flush_packets", "1",
                 mp4_file,
                 "-c:v", "copy", "-f", "hls", "-hls_time", "2", "-hls_list_size", "5",
                 "-hls_flags", "delete_segments", os.path.join(RAM_DISK, "stream.m3u8")
             ]
-            threading.Thread(target=generate_srt, args=(tmp_srt,), daemon=True).start()
+
+            # FIX 3: Write subtitles directly to the permanent disk, not RAM
+            threading.Thread(target=generate_srt, args=(final_srt,), daemon=True).start()
 
         process = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
@@ -91,13 +93,7 @@ def record_loop():
 
         process.wait()
 
-        if not garage_mode_active and os.path.exists(tmp_srt):
-            try:
-                with open(tmp_srt, 'r') as fr, open(final_srt, 'w') as fw:
-                    fw.write(fr.read())
-                os.remove(tmp_srt)
-            except: pass
-
+        # FIX 4: The Hardware Release Buffer
         # Give the Linux kernel 2 seconds to release the /dev/video0 interface before looping.
         # This prevents the "Device Busy" crash that was killing your recordings after the first chunk!
         time.sleep(2)
@@ -116,6 +112,7 @@ def generate_srt(srt_file):
                 f.write(f"{srt_index}\n{start_ts} --> {end_ts}\n")
                 f.write(f"SILVERADO | {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | CPU: {cpu}% | MODE: ROAD\n\n")
                 f.flush()
+                os.fsync(f.fileno()) # FIX 5: Force OS to physically write to disk every second
                 srt_index += 1
                 time.sleep(1.0)
     except: pass
@@ -131,4 +128,3 @@ def stream_ts(filename):
 if __name__ == "__main__":
     threading.Thread(target=record_loop, daemon=True).start()
     app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False, threaded=True)
-
