@@ -56,13 +56,13 @@ VOLT_CRITICAL_HALT = 11.2
 VOLT_LOW_WARNING = 11.8
 AWAKE_THRESHOLD_V = 9.0
 
-# CURRENT SENSOR CALIBRATION (Absolute Hardware Zero)
-# Updated to 0.5847V based on image_8c502f.png (sensor disconnected)
-CURRENT_ZERO_VOLTAGE = 0.5847
-CURRENT_SENSITIVITY_V_PER_A = 0.033
+# CURRENT SENSOR CALIBRATION (Software Differential Vout - Vref)
+CURRENT_SENSITIVITY_V_PER_A = 0.003125
+# The "Tare Weight": The static factory difference between Vout and Vref at 0 Amps (Air Gap)
+CURRENT_ZERO_OFFSET_V = 0.0074
 AMP_CRANK_THRESHOLD = 40.0
 
-# --- HARDWARE SETUP (Pins 14, 16, 18) ---
+# --- HARDWARE SETUP ---
 W1_DEVICE_BASE = '/sys/bus/w1/devices/'
 W1_DATA_GPIO = 23
 W1_POWER_GPIO = 24
@@ -72,15 +72,14 @@ ARGON_FAN_ADDR = 0x1a
 i2c_bus = None
 chan_f12_constant = None
 chan_f26_switched = None
-chan_current_sensor = None
+chan_current_vout = None
+chan_current_vref = None
 low_volt_counter = 0
 
 def hard_reset_1wire():
-    """Toggles GPIO power and reloads modules to clear sensor latch-up."""
     try:
         subprocess.run(['sudo', 'modprobe', '-r', 'w1-therm'], capture_output=True)
         subprocess.run(['sudo', 'modprobe', '-r', 'w1-gpio'], capture_output=True)
-        # Cycle power on Pin 18
         subprocess.run(['sudo', 'pinctrl', 'set', str(W1_POWER_GPIO), 'op', 'dl'], capture_output=True)
         time.sleep(2)
         subprocess.run(['sudo', 'pinctrl', 'set', str(W1_POWER_GPIO), 'op', 'dh'], capture_output=True)
@@ -109,8 +108,7 @@ def get_cabin_temp():
     return None
 
 def init_hardware():
-    global i2c_bus, chan_f12_constant, chan_f26_switched, chan_current_sensor
-    # Ensure Pin 18 is providing 3.3V for the DS18B20 sensor
+    global i2c_bus, chan_f12_constant, chan_f26_switched, chan_current_vout, chan_current_vref
     subprocess.run(['sudo', 'pinctrl', 'set', str(W1_POWER_GPIO), 'op', 'dh'], capture_output=True)
 
     if board and busio:
@@ -118,9 +116,11 @@ def init_hardware():
             i2c_bus = busio.I2C(board.SCL, board.SDA)
             if ADS:
                 ads = ADS.ADS1115(i2c_bus)
+                ads.gain = 1
                 chan_f12_constant = AnalogIn(ads, 0)
                 chan_f26_switched = AnalogIn(ads, 1)
-                chan_current_sensor = AnalogIn(ads, 2)
+                chan_current_vout = AnalogIn(ads, 2) # Yellow Wire (Vout)
+                chan_current_vref = AnalogIn(ads, 3) # Green/White Wire (Vref)
         except Exception: pass
     hard_reset_1wire()
 
@@ -133,11 +133,20 @@ def get_voltage(channel, apply_divider=True):
     return 0.0
 
 def get_current_amps():
-    if chan_current_sensor:
+    if chan_current_vout and chan_current_vref:
         try:
-            sensor_v = get_voltage(chan_current_sensor, apply_divider=False)
-            # Amps = (Observed - Zero) / Sensitivity
-            amps = (sensor_v - CURRENT_ZERO_VOLTAGE) / CURRENT_SENSITIVITY_V_PER_A
+            vout = get_voltage(chan_current_vout, apply_divider=False)
+            vref = get_voltage(chan_current_vref, apply_divider=False)
+
+            # 1. Raw software differential calculation
+            raw_diff_v = vout - vref
+
+            # 2. Subtract the factory static offset (Taring the scale)
+            corrected_diff_v = raw_diff_v - CURRENT_ZERO_OFFSET_V
+
+            # 3. Convert to Amps
+            amps = corrected_diff_v / CURRENT_SENSITIVITY_V_PER_A
+
             return round(amps, 2)
         except: pass
     return 0.0
@@ -217,18 +226,41 @@ def main():
 
     while True:
         try:
+            # 1. Grab environmental variables once per cycle
             cpu_temp = get_cpu_temp()
             fan_speed = set_argon_fan_speed(get_fan_curve_speed(cpu_temp))
             main_v = get_voltage(chan_f12_constant)
             ign_v = get_voltage(chan_f26_switched)
-            amps = get_current_amps()
             cabin_t = get_cabin_temp()
             pwr_status = get_power_status()
-
-            # Adjusted ignition logic to handle ADC noise offset
             is_awake = ign_v > AWAKE_THRESHOLD_V
-            is_cranking = abs(amps) > AMP_CRANK_THRESHOLD
 
+            # 2. FAST POLLING LOOP FOR CURRENT
+            cycle_duration = 10 if is_awake else 60
+
+            # FIX 1: Use time.monotonic() instead of time.time()
+            # If the Pi syncs to a network time server, time.time() jumps forward or backward,
+            # which can cause this inner loop to freeze or act erratically.
+            start_time = time.monotonic()
+
+            peak_draw = 0.0
+            last_amps = 0.0
+
+            while time.monotonic() - start_time < cycle_duration:
+                current = get_current_amps()
+                last_amps = current
+
+                # If we see a massive negative draw (starter motor), lock it in as the peak
+                if current < peak_draw:
+                    peak_draw = current
+
+                time.sleep(0.1) # Check ADC 10 times a second
+
+            # 3. Determine which Amp value to report to HA
+            is_cranking = peak_draw < -AMP_CRANK_THRESHOLD
+            reported_amps = peak_draw if is_cranking else last_amps
+
+            # 4. State Management
             if 0.5 < main_v < VOLT_CRITICAL_HALT:
                 if not is_cranking: low_volt_counter += 1
                 if low_volt_counter >= 5:
@@ -238,14 +270,16 @@ def main():
             else: low_volt_counter = 0
 
             if is_awake != last_awake_state:
-                os.system(f"sudo systemctl {'start' if is_awake else 'stop'} dashcam.service")
+                # FIX 2: Added --no-block. If systemctl hangs, it won't freeze this Python script!
+                os.system(f"sudo systemctl {'start' if is_awake else 'stop'} --no-block dashcam.service")
                 client.publish(f"{BASE_TOPIC}/status", "Awake" if is_awake else "Parked", retain=True)
                 last_awake_state = is_awake
 
+            # 5. Publish Payload
             payload = {
                 "battery_voltage": main_v,
                 "ign_voltage": ign_v,
-                "current_amps": amps,
+                "current_amps": reported_amps,
                 "cabin_temp_c": cabin_t,
                 "cpu_temp_c": cpu_temp,
                 "fan_speed_pct": fan_speed,
@@ -253,9 +287,15 @@ def main():
                 "truck_awake": is_awake,
                 "cpu_usage_pct": psutil.cpu_percent() if psutil else 0
             }
+
+            # FIX 3: Print the output so we can see what's failing in journalctl
             client.publish(f"{BASE_TOPIC}/system", json.dumps(payload), qos=1)
-            time.sleep(10 if is_awake else 60)
-        except Exception: time.sleep(10)
+            print(f"[{time.strftime('%H:%M:%S')}] Published MQTT Payload: {payload}", flush=True)
+
+        except Exception as e:
+            # FIX 4: Expose the hidden error instead of failing silently
+            print(f"CRITICAL LOOP ERROR: {e}", flush=True)
+            time.sleep(10)
 
 if __name__ == "__main__":
     main()
