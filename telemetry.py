@@ -267,11 +267,10 @@ def main():
                     client.publish(f"{BASE_TOPIC}/status", f"HALTING: {main_v}V", retain=True)
                     time.sleep(2)
                     os.system("sudo halt")
-            else: low_volt_counter = 0
+            else:
+                low_volt_counter = 0
 
             if is_awake != last_awake_state:
-                # FIX 2: Added --no-block. If systemctl hangs, it won't freeze this Python script!
-                os.system(f"sudo systemctl {'start' if is_awake else 'stop'} --no-block dashcam.service")
                 client.publish(f"{BASE_TOPIC}/status", "Awake" if is_awake else "Parked", retain=True)
                 last_awake_state = is_awake
 
@@ -313,4 +312,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
