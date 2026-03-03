@@ -17,11 +17,7 @@ parser.add_argument('--ignore-parked', action='store_true', help="Force continuo
 parser.add_argument('--chunk-seconds', type=int, default=900, help="Duration of video chunk in seconds (Default 15m).")
 parser.add_argument('--hw-buffer', type=int, default=2, help="Hardware release buffer time in seconds.")
 parser.add_argument('--compress', action='store_true', help="Use Pi 4 hardware encoder to shrink file size.")
-<<<<<<< HEAD
 parser.add_argument('--bitrate', type=str, default="6M", help="Target bitrate for compression (e.g., 2M, 4M, 500K).")
-=======
-parser.add_argument('--bitrate', type=str, default="3.5M", help="Target bitrate for compression (e.g., 2M, 4M, 500K).")
->>>>>>> 30c540acdf8c15769567255d14edc74cb41c3256
 parser.add_argument('--flip', action='store_true', help="Flip the video 180 degrees for upside-down mounting.")
 args, unknown = parser.parse_known_args()
 
@@ -32,25 +28,10 @@ USE_COMPRESSION = args.compress
 TARGET_BITRATE = args.bitrate
 FLIP_VIDEO = args.flip
 
-<<<<<<< HEAD
 # --- CONFIGURATION ---
 # We use a dedicated subfolder in /dev/shm for the stream to avoid path conflicts.
 RAM_DISK = "/dev/shm/dashcam_stream"
 DISK_PATH = "/mnt/dashcam"
-=======
-# Load Configuration
-CONFIG_PATH = os.path.join(os.path.dirname(__file__), 'config.json')
-try:
-    with open(CONFIG_PATH, 'r') as f:
-        config = json.load(f)
-except Exception:
-    config = {
-        "paths": {"dashcam_mount": "/mnt/dashcam", "ram_disk": "/mnt/ramdisk"}
-    }
-
-DISK_PATH = config['paths']['dashcam_mount']
-RAM_DISK = config['paths']['ram_disk']
->>>>>>> 30c540acdf8c15769567255d14edc74cb41c3256
 MAX_DISK_USAGE_PERCENT = 90
 
 def get_telemetry_raw():
@@ -108,7 +89,6 @@ def record_loop():
         now = datetime.datetime.now()
         ts = now.strftime("%Y%m%d_%H%M%S")
 
-<<<<<<< HEAD
         # Paths for HLS (Always On)
         hls_playlist = os.path.join(RAM_DISK, 'stream.m3u8')
         hls_out = f"[f=hls:hls_time=2:hls_list_size=5:hls_flags=delete_segments]{hls_playlist}"
@@ -130,20 +110,6 @@ def record_loop():
 
         # Build Video Engine
         # Logitech C922 MJPEG -> Pi Hardware H.264
-=======
-        # --- DYNAMIC MUXING BASED ON TELEMETRY ---
-        currently_driving = is_driving()
-
-        hls_out = f"[f=hls:hls_time=2:hls_list_size=5:hls_flags=delete_segments]{os.path.join(RAM_DISK, 'stream.m3u8')}"
-        mp4_out = f"[f=mp4:movflags=+frag_keyframe+empty_moov]{mp4_file}"
-
-        # If driving, write to both MP4 and RAM. If parked, only write to RAM.
-        if currently_driving:
-            tee_map = f"{mp4_out}|{hls_out}"
-        else:
-            tee_map = f"{hls_out}"
-
->>>>>>> 30c540acdf8c15769567255d14edc74cb41c3256
         encode_bitrate = TARGET_BITRATE if USE_COMPRESSION else "8M"
         v_codec = ["-c:v", "h264_v4l2m2m", "-b:v", encode_bitrate, "-num_capture_buffers", "32"]
         v_filter = ["-vf", "vflip,hflip"] if FLIP_VIDEO else []
@@ -158,14 +124,6 @@ def record_loop():
             "-f", "tee", tee_map
         ]
 
-<<<<<<< HEAD
-=======
-        # Stop event to kill the SRT generator if the recording state changes mid-chunk
-        stop_srt_event = threading.Event()
-        if currently_driving:
-            threading.Thread(target=generate_srt, args=(final_srt, stop_srt_event), daemon=True).start()
-
->>>>>>> 30c540acdf8c15769567255d14edc74cb41c3256
         try:
             process = subprocess.Popen(ffmpeg_cmd)
             while process.poll() is None:
@@ -173,17 +131,11 @@ def record_loop():
                     process.terminate()
                     break
 
-<<<<<<< HEAD
                 # Restart pipeline if driving state changes mid-chunk
-=======
-                # Dynamic check: If the truck wakes up or goes to sleep mid-chunk, kill ffmpeg.
-                # The while loop will instantly restart it with the correct `tee_map` configuration.
->>>>>>> 30c540acdf8c15769567255d14edc74cb41c3256
                 if is_driving() != currently_driving:
                     process.terminate()
                     break
 
-<<<<<<< HEAD
                 time.sleep(1)
             process.wait()
         except Exception: pass
@@ -191,13 +143,6 @@ def record_loop():
         if stop_srt_event:
             stop_srt_event.set()
 
-=======
-                time.sleep(2)
-            process.wait()
-        except Exception: pass
-
-        stop_srt_event.set()
->>>>>>> 30c540acdf8c15769567255d14edc74cb41c3256
         time.sleep(HW_BUFFER_SECONDS)
 
 def get_telemetry():
@@ -223,7 +168,7 @@ def generate_srt(srt_file, stop_event):
     except: pass
 
 @app.route('/stream.m3u8')
-def stream_m3u8():
+def stream_m3u8(): 
     return send_from_directory(RAM_DISK, 'stream.m3u8')
 
 @app.route('/<path:filename>')
