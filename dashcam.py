@@ -50,12 +50,13 @@ def is_camera_present():
     return os.path.exists("/dev/video0")
 
 def ensure_paths():
-    """Ensures directories exist and are clean."""
+    """Ensures directories exist and cleans old RAM stream files."""
     if not os.path.exists(RAM_DISK):
-        try:
-            os.makedirs(RAM_DISK, exist_ok=True)
+        try: os.makedirs(RAM_DISK, exist_ok=True)
         except Exception: pass
-    else:
+
+    # Scrub the RAM disk of old stream files so we always start fresh
+    if os.path.exists(RAM_DISK):
         for f in os.listdir(RAM_DISK):
             if f.startswith('stream'):
                 try: os.remove(os.path.join(RAM_DISK, f))
@@ -73,51 +74,55 @@ def cleanup_old_footage():
 
 def record_loop():
     while True:
-        ensure_paths()
         if not is_camera_present():
             time.sleep(5.0)
             continue
 
-        currently_driving = is_driving()
+        # IF TRUCK IS PARKED: Sleep. Do not run the camera. 
+        if not is_driving():
+            time.sleep(2.0)
+            continue
+
+        # --- TRUCK IS AWAKE: START RECORDING ---
+        ensure_paths()
         cleanup_old_footage()
 
         now = datetime.datetime.now()
         ts = now.strftime("%Y%m%d_%H%M%S")
+        daily_path = os.path.join(DISK_PATH, now.strftime("%Y-%m-%d"))
 
+        try:
+            os.makedirs(daily_path, exist_ok=True)
+        except Exception as e:
+            print(f"Cannot write to SD card: {e}")
+            time.sleep(5.0)
+            continue
+
+        mp4_file = os.path.join(daily_path, f"Silverado_{ts}.mp4")
+        final_srt = os.path.join(daily_path, f"Silverado_{ts}.srt")
         hls_playlist = os.path.join(RAM_DISK, 'stream.m3u8')
+
+        mp4_out = f"[f=mp4:movflags=+frag_keyframe+empty_moov]{mp4_file}"
         hls_out = f"[f=hls:hls_time=2:hls_list_size=5:hls_flags=delete_segments]{hls_playlist}"
 
-        can_record_to_disk = False
-        if currently_driving:
-            daily_path = os.path.join(DISK_PATH, now.strftime("%Y-%m-%d"))
-            try:
-                os.makedirs(daily_path, exist_ok=True)
-                mp4_file = os.path.join(daily_path, f"Silverado_{ts}.mp4")
-                final_srt = os.path.join(daily_path, f"Silverado_{ts}.srt")
-                mp4_out = f"[f=mp4:movflags=+frag_keyframe+empty_moov]{mp4_file}"
-                can_record_to_disk = True
-            except Exception as e:
-                print(f"Cannot write to SD card. Streaming only. Error: {e}")
+        # We always output to BOTH the SD card and the RAM stream simultaneously
+        tee_map = f"{mp4_out}|{hls_out}"
 
-        if can_record_to_disk:
-            tee_map = f"{mp4_out}|{hls_out}"
-            stop_srt_event = threading.Event()
-            threading.Thread(target=generate_srt, args=(final_srt, stop_srt_event), daemon=True).start()
-        else:
-            tee_map = hls_out
-            stop_srt_event = None
+        stop_srt_event = threading.Event()
+        threading.Thread(target=generate_srt, args=(final_srt, stop_srt_event), daemon=True).start()
 
         encode_bitrate = TARGET_BITRATE if USE_COMPRESSION else "8M"
 
-        # RESTORE HARDWARE ENCODER (h264_v4l2m2m) FOR LOW CPU USAGE
-        v_codec = ["-c:v", "h264_v4l2m2m", "-b:v", encode_bitrate, "-num_capture_buffers", "32", "-pix_fmt", "yuv420p"]
+        # This is the exact, stable hardware configuration that worked originally.
+        v_codec = ["-c:v", "h264_v4l2m2m", "-b:v", encode_bitrate, "-num_capture_buffers", "32"]
         v_filter = ["-vf", "vflip,hflip"] if FLIP_VIDEO else []
 
         ffmpeg_cmd = [
-            "ffmpeg", "-hide_banner", "-loglevel", "warning", "-nostdin", "-y",
+            "ffmpeg", "-hide_banner", "-loglevel", "warning", "-y",
             "-f", "v4l2", "-input_format", "mjpeg", "-video_size", "1920x1080", "-framerate", "30",
             "-t", str(CHUNK_SECONDS), "-i", "/dev/video0"
         ] + v_filter + v_codec + [
+            "-pix_fmt", "yuv420p",
             "-map", "0:v",
             "-f", "tee", tee_map
         ]
@@ -125,12 +130,11 @@ def record_loop():
         try:
             process = subprocess.Popen(ffmpeg_cmd)
             while process.poll() is None:
-                if not is_camera_present() or (is_driving() != currently_driving):
-                    # Gracefully send Ctrl+C (SIGINT) to allow the hardware chip to flush its memory cleanly
+                # If camera is unplugged or truck turns off, gracefully stop recording
+                if not is_camera_present() or not is_driving():
                     process.send_signal(signal.SIGINT)
                     try:
-                        # Give it up to 10 seconds to wrap up the file and release the hardware buffer
-                        process.wait(timeout=10)
+                        process.wait(timeout=5)
                     except subprocess.TimeoutExpired:
                         process.kill()
                     break
@@ -138,9 +142,7 @@ def record_loop():
             process.wait()
         except Exception: pass
 
-        if stop_srt_event:
-            stop_srt_event.set()
-
+        stop_srt_event.set()
         time.sleep(HW_BUFFER_SECONDS)
 
 def get_telemetry():
@@ -177,4 +179,3 @@ def stream_ts(filename):
 if __name__ == "__main__":
     threading.Thread(target=record_loop, daemon=True).start()
     app.run(host='0.0.0.0', port=5000)
-
