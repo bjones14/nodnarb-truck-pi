@@ -7,6 +7,7 @@ import psutil
 import json
 import argparse
 import shutil
+import signal
 from flask import Flask, send_from_directory
 
 app = Flask(__name__)
@@ -16,7 +17,7 @@ parser = argparse.ArgumentParser(description="Silverado Dashcam Service")
 parser.add_argument('--ignore-parked', action='store_true', help="Force continuous MP4 recording to disk, ignoring telemetry.")
 parser.add_argument('--chunk-seconds', type=int, default=900, help="Duration of video chunk in seconds (Default 15m).")
 parser.add_argument('--hw-buffer', type=int, default=2, help="Hardware release buffer time in seconds.")
-parser.add_argument('--compress', action='store_true', help="Use Pi 4 hardware encoder to shrink file size.")
+parser.add_argument('--compress', action='store_true', help="Use hardware encoder to shrink file size reliably.")
 parser.add_argument('--bitrate', type=str, default="3.5M", help="Target bitrate for compression (e.g., 2M, 4M, 500K).")
 parser.add_argument('--flip', action='store_true', help="Flip the video 180 degrees for upside-down mounting.")
 args, unknown = parser.parse_known_args()
@@ -51,9 +52,10 @@ def is_camera_present():
 def ensure_paths():
     """Ensures directories exist and are clean."""
     if not os.path.exists(RAM_DISK):
-        os.makedirs(RAM_DISK, exist_ok=True)
+        try:
+            os.makedirs(RAM_DISK, exist_ok=True)
+        except Exception: pass
     else:
-        # Clean up old stream files
         for f in os.listdir(RAM_DISK):
             if f.startswith('stream'):
                 try: os.remove(os.path.join(RAM_DISK, f))
@@ -85,15 +87,20 @@ def record_loop():
         hls_playlist = os.path.join(RAM_DISK, 'stream.m3u8')
         hls_out = f"[f=hls:hls_time=2:hls_list_size=5:hls_flags=delete_segments]{hls_playlist}"
 
+        can_record_to_disk = False
         if currently_driving:
             daily_path = os.path.join(DISK_PATH, now.strftime("%Y-%m-%d"))
-            os.makedirs(daily_path, exist_ok=True) # CRITICAL FIX: Ensure the daily folder exists
-            mp4_file = os.path.join(daily_path, f"Silverado_{ts}.mp4")
-            final_srt = os.path.join(daily_path, f"Silverado_{ts}.srt")
+            try:
+                os.makedirs(daily_path, exist_ok=True)
+                mp4_file = os.path.join(daily_path, f"Silverado_{ts}.mp4")
+                final_srt = os.path.join(daily_path, f"Silverado_{ts}.srt")
+                mp4_out = f"[f=mp4:movflags=+frag_keyframe+empty_moov]{mp4_file}"
+                can_record_to_disk = True
+            except Exception as e:
+                print(f"Cannot write to SD card. Streaming only. Error: {e}")
 
-            mp4_out = f"[f=mp4:movflags=+frag_keyframe+empty_moov]{mp4_file}"
+        if can_record_to_disk:
             tee_map = f"{mp4_out}|{hls_out}"
-
             stop_srt_event = threading.Event()
             threading.Thread(target=generate_srt, args=(final_srt, stop_srt_event), daemon=True).start()
         else:
@@ -102,29 +109,30 @@ def record_loop():
 
         encode_bitrate = TARGET_BITRATE if USE_COMPRESSION else "8M"
 
-        # Build filter string
-        # format=yuv420p is required for the hardware encoder to produce valid video (not black)
-        filters = "format=yuv420p"
-        if FLIP_VIDEO:
-            filters = f"vflip,hflip,{filters}"
+        # RESTORE HARDWARE ENCODER (h264_v4l2m2m) FOR LOW CPU USAGE
+        v_codec = ["-c:v", "h264_v4l2m2m", "-b:v", encode_bitrate, "-num_capture_buffers", "32", "-pix_fmt", "yuv420p"]
+        v_filter = ["-vf", "vflip,hflip"] if FLIP_VIDEO else []
 
         ffmpeg_cmd = [
-            "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+            "ffmpeg", "-hide_banner", "-loglevel", "warning", "-nostdin", "-y",
             "-f", "v4l2", "-input_format", "mjpeg", "-video_size", "1920x1080", "-framerate", "30",
-            "-t", str(CHUNK_SECONDS), "-i", "/dev/video0",
-            "-vf", filters,
-            "-c:v", "h264_v4l2m2m", "-b:v", encode_bitrate, "-num_capture_buffers", "32",
-            "-f", "tee", "-map", "0:v", tee_map
+            "-t", str(CHUNK_SECONDS), "-i", "/dev/video0"
+        ] + v_filter + v_codec + [
+            "-map", "0:v",
+            "-f", "tee", tee_map
         ]
 
         try:
             process = subprocess.Popen(ffmpeg_cmd)
             while process.poll() is None:
-                if not is_camera_present():
-                    process.terminate()
-                    break
-                if is_driving() != currently_driving:
-                    process.terminate()
+                if not is_camera_present() or (is_driving() != currently_driving):
+                    # Gracefully send Ctrl+C (SIGINT) to allow the hardware chip to flush its memory cleanly
+                    process.send_signal(signal.SIGINT)
+                    try:
+                        # Give it up to 10 seconds to wrap up the file and release the hardware buffer
+                        process.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
                     break
                 time.sleep(1)
             process.wait()
@@ -169,3 +177,4 @@ def stream_ts(filename):
 if __name__ == "__main__":
     threading.Thread(target=record_loop, daemon=True).start()
     app.run(host='0.0.0.0', port=5000)
+
