@@ -14,7 +14,7 @@ app = Flask(__name__)
 
 # --- PARSE COMMAND LINE ARGS ---
 parser = argparse.ArgumentParser(description="Silverado Dashcam Service")
-parser.add_argument('--ignore-parked', action='store_true', help="Force continuous TS recording to disk, ignoring telemetry.")
+parser.add_argument('--ignore-parked', action='store_true', help="Force continuous MKV recording to disk, ignoring telemetry.")
 parser.add_argument('--chunk-seconds', type=int, default=900, help="Duration of video chunk in seconds (Default 15m).")
 parser.add_argument('--hw-buffer', type=int, default=2, help="Hardware release buffer time in seconds.")
 parser.add_argument('--compress', action='store_true', help="Use hardware encoder to shrink file size reliably.")
@@ -56,11 +56,8 @@ def is_camera_present():
 def init_camera_focus():
     """Forces the Logitech C922 to lock focus to infinity, disabling autofocus hunting."""
     try:
-        # Disable autofocus
         subprocess.run(["v4l2-ctl", "-d", "/dev/video0", "-c", "focus_auto=0"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        # Lock absolute focus to 0 (Infinity for Logitech lenses)
         subprocess.run(["v4l2-ctl", "-d", "/dev/video0", "-c", "focus_absolute=0"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        # Set power line frequency to 60Hz (US) to prevent streetlight flickering
         subprocess.run(["v4l2-ctl", "-d", "/dev/video0", "-c", "power_line_frequency=1"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception as e:
         print(f"Warning: Could not set hardware camera controls: {e}")
@@ -110,7 +107,6 @@ def record_loop():
         ensure_paths()
         cleanup_old_footage()
 
-        # Lock focus to infinity right before we start recording
         init_camera_focus()
 
         now = datetime.datetime.now()
@@ -124,7 +120,8 @@ def record_loop():
             time.sleep(5.0)
             continue
 
-        ts_file = os.path.join(daily_path, f"Silverado_{ts}.ts")
+        # CHANGED TO .mkv FOR CRASH SAFETY AND PERFECT VLC PLAYBACK
+        mkv_file = os.path.join(daily_path, f"Silverado_{ts}.mkv")
         final_srt = os.path.join(daily_path, f"Silverado_{ts}.srt")
         hls_playlist = os.path.join(RAM_DISK, 'stream.m3u8')
 
@@ -136,7 +133,7 @@ def record_loop():
         v_codec = ["-c:v", "h264_v4l2m2m", "-b:v", encode_bitrate, "-num_capture_buffers", "32"]
         v_filter = ["-vf", "vflip,hflip"] if FLIP_VIDEO else []
 
-        tee_map = f"[f=mpegts]{ts_file}|[f=hls:hls_time=2:hls_list_size=5:hls_flags=delete_segments]{hls_playlist}"
+        tee_map = f"[f=matroska]{mkv_file}|[f=hls:hls_time=2:hls_list_size=5:hls_flags=delete_segments]{hls_playlist}"
 
         ffmpeg_cmd = [
             "ffmpeg", "-hide_banner", "-loglevel", "warning", "-y",
@@ -204,7 +201,7 @@ def stream_ts(filename):
 
 
 if __name__ == "__main__":
-    print("Starting Silverado Dashcam Service (TS + Live Stream Mode)...")
+    print("Starting Silverado Dashcam Service (MKV + Live Stream Mode)...")
     threading.Thread(target=record_loop, daemon=True).start()
     app.run(host='0.0.0.0', port=5000)
 
