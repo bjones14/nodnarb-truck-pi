@@ -14,7 +14,7 @@ app = Flask(__name__)
 
 # --- PARSE COMMAND LINE ARGS ---
 parser = argparse.ArgumentParser(description="Silverado Dashcam Service")
-parser.add_argument('--ignore-parked', action='store_true', help="Force continuous MP4 recording to disk, ignoring telemetry.")
+parser.add_argument('--ignore-parked', action='store_true', help="Force continuous TS recording to disk, ignoring telemetry.")
 parser.add_argument('--chunk-seconds', type=int, default=900, help="Duration of video chunk in seconds (Default 15m).")
 parser.add_argument('--hw-buffer', type=int, default=2, help="Hardware release buffer time in seconds.")
 parser.add_argument('--compress', action='store_true', help="Use hardware encoder to shrink file size reliably.")
@@ -78,12 +78,12 @@ def record_loop():
             time.sleep(5.0)
             continue
 
-        # IF TRUCK IS PARKED: Sleep. Do not run the camera. 
+        # IF TRUCK IS PARKED: Sleep. Do not run the camera.
         if not is_driving():
             time.sleep(2.0)
             continue
 
-        # --- TRUCK IS AWAKE: START RECORDING ---
+        # --- TRUCK IS AWAKE: START RECORDING DIRECTLY TO TS AND RAM ---
         ensure_paths()
         cleanup_old_footage()
 
@@ -98,24 +98,21 @@ def record_loop():
             time.sleep(5.0)
             continue
 
-        mp4_file = os.path.join(daily_path, f"Silverado_{ts}.mp4")
+        # CHANGED TO .ts FOR CRASH SAFETY AND TEE COMPATIBILITY
+        ts_file = os.path.join(daily_path, f"Silverado_{ts}.ts")
         final_srt = os.path.join(daily_path, f"Silverado_{ts}.srt")
         hls_playlist = os.path.join(RAM_DISK, 'stream.m3u8')
-
-        mp4_out = f"[f=mp4:movflags=+frag_keyframe+empty_moov]{mp4_file}"
-        hls_out = f"[f=hls:hls_time=2:hls_list_size=5:hls_flags=delete_segments]{hls_playlist}"
-
-        # We always output to BOTH the SD card and the RAM stream simultaneously
-        tee_map = f"{mp4_out}|{hls_out}"
 
         stop_srt_event = threading.Event()
         threading.Thread(target=generate_srt, args=(final_srt, stop_srt_event), daemon=True).start()
 
         encode_bitrate = TARGET_BITRATE if USE_COMPRESSION else "8M"
 
-        # This is the exact, stable hardware configuration that worked originally.
         v_codec = ["-c:v", "h264_v4l2m2m", "-b:v", encode_bitrate, "-num_capture_buffers", "32"]
         v_filter = ["-vf", "vflip,hflip"] if FLIP_VIDEO else []
+
+        # Map to both the TS file on disk and the HLS stream in RAM seamlessly
+        tee_map = f"[f=mpegts]{ts_file}|[f=hls:hls_time=2:hls_list_size=5:hls_flags=delete_segments]{hls_playlist}"
 
         ffmpeg_cmd = [
             "ffmpeg", "-hide_banner", "-loglevel", "warning", "-y",
@@ -130,7 +127,6 @@ def record_loop():
         try:
             process = subprocess.Popen(ffmpeg_cmd)
             while process.poll() is None:
-                # If camera is unplugged or truck turns off, gracefully stop recording
                 if not is_camera_present() or not is_driving():
                     process.send_signal(signal.SIGINT)
                     try:
@@ -177,5 +173,7 @@ def stream_ts(filename):
     return "Not found", 404
 
 if __name__ == "__main__":
+    print("Starting Silverado Dashcam Service (TS + Live Stream Mode)...")
     threading.Thread(target=record_loop, daemon=True).start()
     app.run(host='0.0.0.0', port=5000)
+
