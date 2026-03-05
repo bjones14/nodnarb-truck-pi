@@ -18,7 +18,7 @@ parser.add_argument('--ignore-parked', action='store_true', help="Force continuo
 parser.add_argument('--chunk-seconds', type=int, default=900, help="Duration of video chunk in seconds (Default 15m).")
 parser.add_argument('--hw-buffer', type=int, default=2, help="Hardware release buffer time in seconds.")
 parser.add_argument('--compress', action='store_true', help="Use hardware encoder to shrink file size reliably.")
-parser.add_argument('--bitrate', type=str, default="3.5M", help="Target bitrate for compression (e.g., 2M, 4M, 500K).")
+parser.add_argument('--bitrate', type=str, default="6M", help="Target bitrate for compression (e.g., 2M, 4M, 500K).")
 parser.add_argument('--flip', action='store_true', help="Flip the video 180 degrees for upside-down mounting.")
 args, unknown = parser.parse_known_args()
 
@@ -34,6 +34,7 @@ RAM_DISK = "/dev/shm/dashcam_stream"
 DISK_PATH = "/mnt/dashcam"
 MAX_DISK_USAGE_PERCENT = 90
 
+
 def get_telemetry_raw():
     try:
         with open("/dev/shm/telemetry.json", "r") as f:
@@ -41,36 +42,59 @@ def get_telemetry_raw():
     except Exception:
         return {}
 
+
 def is_driving():
     if IGNORE_PARKED:
         return True
     return get_telemetry_raw().get('truck_awake', False)
 
+
 def is_camera_present():
     return os.path.exists("/dev/video0")
+
+
+def init_camera_focus():
+    """Forces the Logitech C922 to lock focus to infinity, disabling autofocus hunting."""
+    try:
+        # Disable autofocus
+        subprocess.run(["v4l2-ctl", "-d", "/dev/video0", "-c", "focus_auto=0"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # Lock absolute focus to 0 (Infinity for Logitech lenses)
+        subprocess.run(["v4l2-ctl", "-d", "/dev/video0", "-c", "focus_absolute=0"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # Set power line frequency to 60Hz (US) to prevent streetlight flickering
+        subprocess.run(["v4l2-ctl", "-d", "/dev/video0", "-c", "power_line_frequency=1"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as e:
+        print(f"Warning: Could not set hardware camera controls: {e}")
+
 
 def ensure_paths():
     """Ensures directories exist and cleans old RAM stream files."""
     if not os.path.exists(RAM_DISK):
-        try: os.makedirs(RAM_DISK, exist_ok=True)
-        except Exception: pass
+        try:
+            os.makedirs(RAM_DISK, exist_ok=True)
+        except Exception:
+            pass
 
-    # Scrub the RAM disk of old stream files so we always start fresh
     if os.path.exists(RAM_DISK):
         for f in os.listdir(RAM_DISK):
             if f.startswith('stream'):
-                try: os.remove(os.path.join(RAM_DISK, f))
-                except: pass
+                try:
+                    os.remove(os.path.join(RAM_DISK, f))
+                except Exception:
+                    pass
+
 
 def cleanup_old_footage():
     try:
-        if not os.path.exists(DISK_PATH): return
+        if not os.path.exists(DISK_PATH):
+            return
         usage = psutil.disk_usage(DISK_PATH)
         if usage.percent > MAX_DISK_USAGE_PERCENT:
             folders = sorted([f for f in os.listdir(DISK_PATH) if os.path.isdir(os.path.join(DISK_PATH, f))])
             if folders:
                 shutil.rmtree(os.path.join(DISK_PATH, folders[0]))
-    except Exception: pass
+    except Exception:
+        pass
+
 
 def record_loop():
     while True:
@@ -78,14 +102,16 @@ def record_loop():
             time.sleep(5.0)
             continue
 
-        # IF TRUCK IS PARKED: Sleep. Do not run the camera.
         if not is_driving():
             time.sleep(2.0)
             continue
 
-        # --- TRUCK IS AWAKE: START RECORDING DIRECTLY TO TS AND RAM ---
+        # --- TRUCK IS AWAKE: START RECORDING ---
         ensure_paths()
         cleanup_old_footage()
+
+        # Lock focus to infinity right before we start recording
+        init_camera_focus()
 
         now = datetime.datetime.now()
         ts = now.strftime("%Y%m%d_%H%M%S")
@@ -98,7 +124,6 @@ def record_loop():
             time.sleep(5.0)
             continue
 
-        # CHANGED TO .ts FOR CRASH SAFETY AND TEE COMPATIBILITY
         ts_file = os.path.join(daily_path, f"Silverado_{ts}.ts")
         final_srt = os.path.join(daily_path, f"Silverado_{ts}.srt")
         hls_playlist = os.path.join(RAM_DISK, 'stream.m3u8')
@@ -111,7 +136,6 @@ def record_loop():
         v_codec = ["-c:v", "h264_v4l2m2m", "-b:v", encode_bitrate, "-num_capture_buffers", "32"]
         v_filter = ["-vf", "vflip,hflip"] if FLIP_VIDEO else []
 
-        # Map to both the TS file on disk and the HLS stream in RAM seamlessly
         tee_map = f"[f=mpegts]{ts_file}|[f=hls:hls_time=2:hls_list_size=5:hls_flags=delete_segments]{hls_playlist}"
 
         ffmpeg_cmd = [
@@ -136,15 +160,18 @@ def record_loop():
                     break
                 time.sleep(1)
             process.wait()
-        except Exception: pass
+        except Exception:
+            pass
 
         stop_srt_event.set()
         time.sleep(HW_BUFFER_SECONDS)
 
+
 def get_telemetry():
     d = get_telemetry_raw()
     temp = f"{(d.get('cabin_temp_c', 0)*9/5)+32:.0f}F" if d.get("cabin_temp_c") else "N/A"
-    return temp, f"{d.get('battery_voltage',0):.1f}", f"{d.get('current_amps',0):.1f}"
+    return temp, f"{d.get('battery_voltage', 0):.1f}", f"{d.get('current_amps', 0):.1f}"
+
 
 def generate_srt(srt_file, stop_event):
     idx = 1
@@ -160,17 +187,21 @@ def generate_srt(srt_file, stop_event):
                 f.flush()
                 idx += 1
                 time.sleep(1.0)
-    except: pass
+    except Exception:
+        pass
+
 
 @app.route('/stream.m3u8')
 def stream_m3u8():
     return send_from_directory(RAM_DISK, 'stream.m3u8')
+
 
 @app.route('/<path:filename>')
 def stream_ts(filename):
     if filename.endswith('.ts'):
         return send_from_directory(RAM_DISK, filename)
     return "Not found", 404
+
 
 if __name__ == "__main__":
     print("Starting Silverado Dashcam Service (TS + Live Stream Mode)...")
