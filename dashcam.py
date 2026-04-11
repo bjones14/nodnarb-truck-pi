@@ -115,8 +115,9 @@ def get_telemetry():
 
     v = f"{safe_float('battery_voltage'):.1f}"
     a = f"{safe_float('current_amps'):.1f}"
+    soc = f"{safe_float('soc_percent'):.1f}"
 
-    return v, a
+    return v, a, soc
 
 
 def generate_srt(srt_file, mkv_file, stop_event):
@@ -143,11 +144,13 @@ def generate_srt(srt_file, mkv_file, stop_event):
             while idx <= CHUNK_SECONDS and not stop_event.is_set():
                 elapsed = time.monotonic() - start
                 ts_now = datetime.datetime.now().strftime('%I:%M:%S %p')
-                v, a = get_telemetry()
+                v, a, soc = get_telemetry()
 
                 f.write(f"{idx}\n{str(datetime.timedelta(seconds=int(elapsed)))},000 --> "
                         f"{str(datetime.timedelta(seconds=int(elapsed+1)))},000\n")
-                f.write(f"{ts_now} | Bat: {v}V {a}A\n\n")
+
+                # Updated subtitle format: Time | Bat | SoC
+                f.write(f"{ts_now} | Bat: {v}V {a}A | SoC: {soc}%\n\n")
                 f.flush()
 
                 idx += 1
@@ -205,7 +208,7 @@ def record_loop():
         if AUDIO_MIC:
             ffmpeg_cmd += ["-f", "alsa", "-channels", "2", "-i", AUDIO_MIC]
 
-        # Filter construction
+        # Filter construction: Includes the audio limiter we discussed
         v_filter = "vflip,hflip,format=yuv420p" if FLIP_VIDEO else "format=yuv420p"
         a_filter = "alimiter=limit=0.8:level=0:attack=5:release=50"
 
@@ -264,4 +267,3 @@ if __name__ == "__main__":
     print("Starting Silverado Dashcam Service...")
     threading.Thread(target=record_loop, daemon=True).start()
     app.run(host='0.0.0.0', port=5000)
-
