@@ -1,13 +1,14 @@
-import os
-import time
-import threading
-import datetime
-import subprocess
-import psutil
-import json
 import argparse
+import datetime
+import json
+import os
 import shutil
 import signal
+import subprocess
+import threading
+import time
+
+import psutil
 from flask import Flask, send_from_directory
 
 app = Flask(__name__)
@@ -20,7 +21,7 @@ parser.add_argument('--hw-buffer', type=int, default=2, help="Hardware release b
 parser.add_argument('--compress', action='store_true', help="Use hardware encoder to shrink file size.")
 parser.add_argument('--bitrate', type=str, default="6M", help="Target bitrate for compression.")
 parser.add_argument('--flip', action='store_true', help="Flip the video 180 degrees.")
-parser.add_argument('--mic', type=str, default="", help="ALSA audio device (e.g., plughw:CARD=Stream,DEV=0).")
+parser.add_argument('--mic', type=str, default="plughw:CARD=Stream,DEV=0", help="ALSA audio device.")
 args, unknown = parser.parse_known_args()
 
 IGNORE_PARKED = args.ignore_parked
@@ -112,13 +113,10 @@ def get_telemetry():
         except (ValueError, TypeError):
             return 0.0
 
-    temp_c = safe_float('cabin_temp_c')
-    temp_f = f"{(temp_c * 9/5) + 32:.0f}F" if temp_c != 0.0 else "N/A"
-
     v = f"{safe_float('battery_voltage'):.1f}"
     a = f"{safe_float('current_amps'):.1f}"
 
-    return temp_f, v, a
+    return v, a
 
 
 def generate_srt(srt_file, mkv_file, stop_event):
@@ -144,12 +142,12 @@ def generate_srt(srt_file, mkv_file, stop_event):
         with open(srt_file, "w") as f:
             while idx <= CHUNK_SECONDS and not stop_event.is_set():
                 elapsed = time.monotonic() - start
-                ts_now = datetime.datetime.now().strftime('%H:%M:%S')
-                t, v, a = get_telemetry()
+                ts_now = datetime.datetime.now().strftime('%I:%M:%S %p')
+                v, a = get_telemetry()
 
                 f.write(f"{idx}\n{str(datetime.timedelta(seconds=int(elapsed)))},000 --> "
                         f"{str(datetime.timedelta(seconds=int(elapsed+1)))},000\n")
-                f.write(f"{ts_now} | Bat: {v}V {a}A | Cabin: {t}\n\n")
+                f.write(f"{ts_now} | Bat: {v}V {a}A\n\n")
                 f.flush()
 
                 idx += 1
@@ -207,12 +205,15 @@ def record_loop():
         if AUDIO_MIC:
             ffmpeg_cmd += ["-f", "alsa", "-channels", "2", "-i", AUDIO_MIC]
 
-        # Encoders (Hardware H264 + AAC)
-        v_codec = ["-c:v", "h264_v4l2m2m", "-b:v", encode_bitrate, "-num_capture_buffers", "32"]
-        v_filter = ["-vf", "vflip,hflip"] if FLIP_VIDEO else []
-        a_codec = ["-c:a", "aac", "-b:a", "128k"] if AUDIO_MIC else []
+        # Filter construction
+        v_filter = "vflip,hflip,format=yuv420p" if FLIP_VIDEO else "format=yuv420p"
+        a_filter = "alimiter=limit=0.8:level=0:attack=5:release=50"
 
-        ffmpeg_cmd += v_filter + v_codec + a_codec + ["-pix_fmt", "yuv420p"]
+        # Encoders (Hardware H264 + AAC)
+        v_codec = ["-c:v", "h264_v4l2m2m", "-b:v", encode_bitrate, "-num_capture_buffers", "32", "-vf", v_filter]
+        a_codec = ["-c:a", "aac", "-b:a", "128k", "-af", a_filter] if AUDIO_MIC else []
+
+        ffmpeg_cmd += v_codec + a_codec
 
         # Stream Mapping and Tee configuration
         if AUDIO_MIC:
@@ -263,3 +264,4 @@ if __name__ == "__main__":
     print("Starting Silverado Dashcam Service...")
     threading.Thread(target=record_loop, daemon=True).start()
     app.run(host='0.0.0.0', port=5000)
+
