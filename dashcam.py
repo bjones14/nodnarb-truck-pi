@@ -208,9 +208,9 @@ def record_loop():
         if AUDIO_MIC:
             ffmpeg_cmd += ["-f", "alsa", "-channels", "2", "-i", AUDIO_MIC]
 
-        # Filter construction: Includes the audio limiter we discussed
+        # Filter construction: Includes the audio high-pass and aggressive limiter
         v_filter = "vflip,hflip,format=yuv420p" if FLIP_VIDEO else "format=yuv420p"
-        a_filter = "alimiter=limit=0.8:level=0:attack=5:release=50"
+        a_filter = "highpass=f=100,alimiter=limit=0.4:level=0:attack=2:release=50"
 
         # Encoders (Hardware H264 + AAC)
         v_codec = ["-c:v", "h264_v4l2m2m", "-b:v", encode_bitrate, "-num_capture_buffers", "32", "-vf", v_filter]
@@ -267,3 +267,4 @@ if __name__ == "__main__":
     print("Starting Silverado Dashcam Service...")
     threading.Thread(target=record_loop, daemon=True).start()
     app.run(host='0.0.0.0', port=5000)
+
