@@ -1,4 +1,3 @@
-import glob
 import json
 import os
 import subprocess
@@ -89,11 +88,6 @@ SOC_STATE_FILE = os.path.join(SCRIPT_DIR, "soc_state.json")
 FLOAT_VOLTAGE_THRESHOLD = 13.2
 FLOAT_TIME_THRESHOLD_SEC = 3600  # 1 hour
 
-# --- HARDWARE SETUP ---
-W1_DEVICE_BASE = '/sys/bus/w1/devices/'
-W1_DATA_GPIO = 23
-W1_POWER_GPIO = 24
-
 # --- FAN CONFIG (Sysfs & GPIO) ---
 PWM_PATH = "/sys/class/pwm/pwmchip0"
 PWM_CHANNEL = "pwm0"
@@ -115,19 +109,19 @@ class TruckFanController:
         self.tach_pulses = 0
         self.last_tach_time = time.monotonic()
         self.current_rpm = 0
-        
+
         # 1. Initialize Hardware PWM via Sysfs
         try:
             if not os.path.exists(PWM_FULL_PATH):
                 with open(f"{PWM_PATH}/export", "w") as f:
                     f.write("0")
-                time.sleep(0.5)  # Wait for kernel to populate files
+                time.sleep(0.5)
                 with open(f"{PWM_FULL_PATH}/period", "w") as f:
                     f.write(str(PWM_PERIOD_NS))
                 with open(f"{PWM_FULL_PATH}/enable", "w") as f:
                     f.write("1")
         except Exception as e:
-            print(f"Warning: PWM Init Error (Are overlays correct?): {e}")
+            print(f"Warning: PWM Init Error: {e}")
 
         # 2. Initialize Tachometer via gpiozero
         if GPIOZERO_AVAILABLE:
@@ -147,41 +141,35 @@ class TruckFanController:
         try:
             with open(f"{PWM_FULL_PATH}/duty_cycle", "w") as f:
                 f.write(str(duty_cycle))
-        except Exception as e:
-            pass  # Fail silently to avoid crashing the telemetry loop
+        except Exception:
+            pass
         return percent
 
     def get_rpm(self):
         """Calculates RPM from pulse counts."""
         now = time.monotonic()
         dt = now - self.last_tach_time
-        
         if dt > 1.0:
-            # 2 pulses per revolution for standard PC fans
             self.current_rpm = (self.tach_pulses * 30.0) / dt
             self.tach_pulses = 0
             self.last_tach_time = now
-            
         return int(self.current_rpm)
 
 
 class BatteryTracker:
     def __init__(self, capacity_ah):
         self.capacity_ah = capacity_ah
-        self.soc = 1.0  # Default to 100%
+        self.soc = 1.0
         self.float_timer = 0.0
-
         self.load_state()
-
         self.sim = None
         if PYBAMM_AVAILABLE:
             try:
                 model = pybamm.lead_acid.LOQS()
                 self.sim = pybamm.Simulation(model)
-                print("PyBaMM Lead-Acid model initialized successfully.")
+                print("PyBaMM Lead-Acid model initialized.")
             except Exception as e:
-                print(f"Warning: Failed to initialize PyBaMM model: {e}")
-                self.sim = None
+                print(f"Warning: PyBaMM error: {e}")
 
     def update(self, current_amps, voltage, dt_seconds):
         ah_delta = (current_amps * dt_seconds) / 3600.0
@@ -194,13 +182,6 @@ class BatteryTracker:
                 self.soc = 1.0
         else:
             self.float_timer = 0.0
-
-        if self.sim and dt_seconds > 0:
-            try:
-                pass  # Placeholder for active step logic
-            except Exception as e:
-                print(f"PyBaMM step error: {e}")
-
         return self.soc * 100.0
 
     def save_state(self):
@@ -218,50 +199,11 @@ class BatteryTracker:
                     self.soc = data.get("soc_fraction", 1.0)
                     print(f"Loaded persistent SoC state: {self.soc * 100:.1f}%")
         except Exception as e:
-            print(f"Could not load SoC state, defaulting to 100%: {e}")
-
-
-def hard_reset_1wire():
-    try:
-        subprocess.run(['sudo', 'modprobe', '-r', 'w1-therm'], capture_output=True)
-        subprocess.run(['sudo', 'modprobe', '-r', 'w1-gpio'], capture_output=True)
-        subprocess.run(['sudo', 'pinctrl', 'set', str(W1_POWER_GPIO), 'op', 'dl'], capture_output=True)
-        time.sleep(2)
-        subprocess.run(['sudo', 'pinctrl', 'set', str(W1_POWER_GPIO), 'op', 'dh'], capture_output=True)
-        time.sleep(1)
-        subprocess.run(['sudo', 'modprobe', 'w1-gpio'], capture_output=True)
-        subprocess.run(['sudo', 'modprobe', 'w1-therm'], capture_output=True)
-        time.sleep(2)
-    except Exception:
-        pass
-
-
-def get_cabin_temp():
-    try:
-        device_folders = glob.glob(W1_DEVICE_BASE + '28*')
-        if not device_folders:
-            hard_reset_1wire()
-            return None
-        device_file = device_folders[0] + '/w1_slave'
-        if not os.path.exists(device_file):
-            return None
-        with open(device_file, 'r') as f:
-            lines = f.readlines()
-        if not lines or "YES" not in lines[0]:
-            return None
-        equals_pos = lines[1].find('t=')
-        if equals_pos != -1:
-            temp_string = lines[1][equals_pos+2:]
-            return round(float(temp_string) / 1000.0, 1)
-    except Exception:
-        pass
-    return None
+            print(f"Could not load SoC state: {e}")
 
 
 def init_hardware():
     global i2c_bus, chan_f12_constant, chan_f26_switched, chan_current_vout, chan_current_vref
-    subprocess.run(['sudo', 'pinctrl', 'set', str(W1_POWER_GPIO), 'op', 'dh'], capture_output=True)
-
     if board and busio:
         try:
             i2c_bus = busio.I2C(board.SCL, board.SDA)
@@ -274,7 +216,6 @@ def init_hardware():
                 chan_current_vref = AnalogIn(ads, 3)
         except Exception:
             pass
-    hard_reset_1wire()
 
 
 def get_voltage(channel, apply_divider=True):
@@ -335,12 +276,12 @@ def publish_ha_discovery(client):
         "model": "Pi 4 Pro",
         "manufacturer": "Custom"
     }
+    # Removed Cabin Temp from discovery
     sensors = [
         {"id": "batt_v", "name": "Main Battery", "cmp": "sensor", "cls": "voltage", "unit": "V", "tpl": "{{ value_json.battery_voltage }}"},
         {"id": "ign_v", "name": "Ignition Signal", "cmp": "sensor", "cls": "voltage", "unit": "V", "tpl": "{{ value_json.ign_voltage }}"},
         {"id": "curr", "name": "Battery Current", "cmp": "sensor", "cls": "current", "unit": "A", "tpl": "{{ value_json.current_amps }}"},
         {"id": "soc", "name": "Battery SoC", "cmp": "sensor", "cls": "battery", "unit": "%", "tpl": "{{ value_json.soc_percent | round(1) }}"},
-        {"id": "cabin_t", "name": "Truck Cabin Temp", "cmp": "sensor", "cls": "temperature", "unit": "°C", "tpl": "{{ value_json.cabin_temp_c }}"},
         {"id": "cpu_t", "name": "Pi CPU Temp", "cmp": "sensor", "cls": "temperature", "unit": "°C", "tpl": "{{ value_json.cpu_temp_c }}"},
         {"id": "fan_s", "name": "Fan Duty Cycle", "cmp": "sensor", "unit": "%", "tpl": "{{ value_json.fan_speed_pct }}", "icon": "mdi:fan"},
         {"id": "fan_rpm", "name": "Fan Speed (RPM)", "cmp": "sensor", "unit": "RPM", "tpl": "{{ value_json.fan_rpm }}", "icon": "mdi:fan-speed"},
@@ -391,26 +332,20 @@ def main():
 
     while True:
         try:
-            # 1. Grab environmental variables once per cycle
             cpu_temp = get_cpu_temp()
             fan_speed_target = get_fan_curve_speed(cpu_temp)
-            
-            # Apply and read fan hardware
             current_fan_speed = fan.set_speed(fan_speed_target)
             current_fan_rpm = fan.get_rpm()
-            
+
             main_v = get_voltage(chan_f12_constant)
             ign_v = get_voltage(chan_f26_switched)
-            cabin_t = get_cabin_temp()
             pwr_status = get_power_status()
             is_awake = ign_v > AWAKE_THRESHOLD_V
 
-            # 2. QUICK POLLING BURST FOR CURRENT (Fixed for fast updates)
-            # Burst-poll for just 1 second to catch any sudden starter cranking spikes
+            # Current Polling
             start_time = time.monotonic()
             peak_draw = 0.0
             last_amps = 0.0
-
             while time.monotonic() - start_time < 1.0:
                 current = get_current_amps()
                 last_amps = current
@@ -418,21 +353,18 @@ def main():
                     peak_draw = current
                 time.sleep(0.1)
 
-            # 3. Process Amp and SoC Data
             is_cranking = peak_draw < -AMP_CRANK_THRESHOLD
             reported_amps = peak_draw if is_cranking else last_amps
 
             now = time.monotonic()
             dt_seconds = now - last_tracker_time
             last_tracker_time = now
-
             soc_percent = tracker.update(reported_amps, main_v, dt_seconds)
 
-            # 4. State Management & Low Voltage Shutdown
+            # Shutdown Logic
             if 0.5 < main_v <= VOLT_LOW_SHUTDOWN:
                 if not is_cranking:
                     low_volt_seconds += dt_seconds
-
                 if low_volt_seconds >= SHUTDOWN_DELAY_SECONDS:
                     client.publish(f"{BASE_TOPIC}/status", f"HALTING: {main_v}V", retain=True)
                     tracker.save_state()
@@ -445,13 +377,11 @@ def main():
                 client.publish(f"{BASE_TOPIC}/status", "Awake" if is_awake else "Parked", retain=True)
                 last_awake_state = is_awake
 
-            # 5. Publish Payload
             payload = {
                 "battery_voltage": main_v,
                 "ign_voltage": ign_v,
                 "current_amps": reported_amps,
                 "soc_percent": soc_percent,
-                "cabin_temp_c": cabin_t,
                 "cpu_temp_c": cpu_temp,
                 "fan_speed_pct": current_fan_speed,
                 "fan_rpm": current_fan_rpm,
@@ -460,25 +390,11 @@ def main():
                 "cpu_usage_pct": psutil.cpu_percent() if psutil else 0
             }
 
-            try:
-                tmp_file = "/dev/shm/telemetry.tmp"
-                final_file = "/dev/shm/telemetry.json"
-                with open(tmp_file, "w") as f:
-                    json.dump(payload, f)
-                os.rename(tmp_file, final_file)
-            except Exception:
-                pass
-
             client.publish(f"{BASE_TOPIC}/system", json.dumps(payload), qos=1)
             print(f"[{time.strftime('%H:%M:%S')}] CPU: {cpu_temp}°C | Fan: {current_fan_speed}% ({current_fan_rpm} RPM)", flush=True)
 
-            # Save SoC state periodically
             if int(now) % 300 < 2:
                 tracker.save_state()
-            
-            # Sleep longer ONLY if the truck is parked to save battery
-            if not is_awake:
-                time.sleep(15)
 
         except Exception as e:
             print(f"CRITICAL LOOP ERROR: {e}", flush=True)
