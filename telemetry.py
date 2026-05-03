@@ -1,7 +1,6 @@
 import glob
 import json
 import os
-import signal
 import subprocess
 import sys
 import time
@@ -16,6 +15,8 @@ ADS = None
 AnalogIn = None
 board = None
 busio = None
+PWMOutputDevice = None
+DigitalInputDevice = None
 
 try:
     import psutil
@@ -37,12 +38,18 @@ except ImportError:
     pass
 
 try:
+    from gpiozero import PWMOutputDevice, DigitalInputDevice
+    GPIOZERO_AVAILABLE = True
+except ImportError:
+    GPIOZERO_AVAILABLE = False
+
+try:
     import pybamm
     PYBAMM_AVAILABLE = True
 except ImportError:
     PYBAMM_AVAILABLE = False
 
-# Load Configuration & Set File Paths
+# --- CONFIGURATION & FILE PATHS ---
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(SCRIPT_DIR, 'config.json')
 
@@ -50,7 +57,14 @@ try:
     with open(CONFIG_PATH, 'r') as f:
         config = json.load(f)
 except Exception:
-    config = {"mqtt": {"broker": "homeassistant", "port": 1883, "user": "truck", "pass": "truck"}}
+    config = {
+        "mqtt": {
+            "broker": "homeassistant",
+            "port": 1883,
+            "user": "truck",
+            "pass": "truck"
+        }
+    }
 
 # --- MQTT CONFIG ---
 BROKER_IP = config.get('mqtt', {}).get('broker', 'homeassistant')
@@ -80,7 +94,10 @@ FLOAT_TIME_THRESHOLD_SEC = 3600  # 1 hour
 W1_DEVICE_BASE = '/sys/bus/w1/devices/'
 W1_DATA_GPIO = 23
 W1_POWER_GPIO = 24
-ARGON_FAN_ADDR = 0x1a
+
+# Fan Pins (Mapped to your 1x2 signal header)
+FAN_PWM_PIN = 18
+FAN_TACH_PIN = 15
 
 # --- GLOBAL STATE ---
 i2c_bus = None
@@ -88,6 +105,58 @@ chan_f12_constant = None
 chan_f26_switched = None
 chan_current_vout = None
 chan_current_vref = None
+
+
+class NoctuaFan:
+    """Handles 25kHz PWM output and Tachometer RPM calculations for Noctua 4-pin fans."""
+    def __init__(self, pwm_pin, tach_pin):
+        self.pwm_pin = pwm_pin
+        self.tach_pin = tach_pin
+        self.tach_pulses = 0
+        self.last_time = time.monotonic()
+        self.current_rpm = 0
+
+        if GPIOZERO_AVAILABLE:
+            try:
+                # 25kHz is the Intel standard for 4-pin PWM computer fans
+                self.pwm = PWMOutputDevice(self.pwm_pin, frequency=25000)
+                # Tach uses an open-collector output, requires pull-up
+                self.tach = DigitalInputDevice(self.tach_pin, pull_up=True)
+                self.tach.when_activated = self._tach_callback
+            except Exception as e:
+                print(f"Failed to initialize fan on GPIO {pwm_pin}/{tach_pin}: {e}")
+                self.pwm = None
+                self.tach = None
+        else:
+            print("gpiozero library not found. Fan control disabled.")
+            self.pwm = None
+            self.tach = None
+
+    def _tach_callback(self):
+        """Hardware interrupt callback for fan pulses."""
+        self.tach_pulses += 1
+
+    def set_speed(self, speed_percent):
+        """Sets the fan duty cycle (0-100)."""
+        if self.pwm:
+            speed_percent = max(0, min(100, speed_percent))
+            self.pwm.value = speed_percent / 100.0
+        return speed_percent
+
+    def get_rpm(self):
+        """Calculates RPM based on pulses since last reading."""
+        now = time.monotonic()
+        dt = now - self.last_time
+
+        # Calculate only if enough time has passed to get a stable pulse count
+        if dt > 0.5:
+            # Standard PC fans output 2 pulses per revolution
+            # RPM = (pulses / 2) / (dt / 60) -> pulses * 30 / dt
+            self.current_rpm = (self.tach_pulses * 30.0) / dt
+            self.tach_pulses = 0
+            self.last_time = now
+
+        return int(self.current_rpm)
 
 
 class BatteryTracker:
@@ -116,7 +185,6 @@ class BatteryTracker:
         self.soc = max(0.0, min(1.0, self.soc))
 
         # Auto-Sync to 100% if floating/charging
-        # If voltage is high and we aren't draining heavily, start the timer
         if voltage >= FLOAT_VOLTAGE_THRESHOLD and current_amps >= -0.5:
             self.float_timer += dt_seconds
             if self.float_timer >= FLOAT_TIME_THRESHOLD_SEC:
@@ -125,12 +193,9 @@ class BatteryTracker:
             self.float_timer = 0.0
 
         # 2. PyBaMM ECM Correction
-        # If the model is active, we step it forward and use its internal
-        # voltage estimation to correct long-term Coulomb counting drift.
         if self.sim and dt_seconds > 0:
             try:
-                # Placeholder for active step logic
-                pass
+                pass  # Placeholder for active step logic
             except Exception as e:
                 print(f"PyBaMM step error: {e}")
 
@@ -234,27 +299,13 @@ def get_current_amps():
     return 0.0
 
 
-def set_argon_fan_speed(speed):
-    if i2c_bus:
-        try:
-            while not i2c_bus.try_lock():
-                pass
-            i2c_bus.writeto(ARGON_FAN_ADDR, bytes([int(speed)]))
-            i2c_bus.unlock()
-            return int(speed)
-        except Exception:
-            try:
-                i2c_bus.unlock()
-            except Exception:
-                pass
-    return 0
-
-
 def get_fan_curve_speed(temp_c):
-    if temp_c < 55: return 0
-    if temp_c < 60: return 30
-    if temp_c < 65: return 55
-    if temp_c < 70: return 80
+    if temp_c < 50:
+        return 0
+    if temp_c < 60:
+        return 35
+    if temp_c < 70:
+        return 65
     return 100
 
 
@@ -270,15 +321,23 @@ def get_power_status():
     try:
         res = subprocess.check_output(["vcgencmd", "get_throttled"], encoding='utf-8')
         val = int(res.strip().split('=')[1], 16)
-        if bool(val & 0x1): return "Problem (Low Voltage)"
-        if bool(val & 0x10000): return "Warning (Voltage Dip)"
+        if bool(val & 0x1):
+            return "Problem (Low Voltage)"
+        if bool(val & 0x10000):
+            return "Warning (Voltage Dip)"
         return "Stable"
     except Exception:
         return "Unknown"
 
 
 def publish_ha_discovery(client):
-    device_info = {"identifiers": ["silverado_telemetry_pi"], "name": "Silverado Telemetry Node", "model": "Pi 4 Pro", "manufacturer": "Custom"}
+    device_info = {
+        "identifiers": ["silverado_telemetry_pi"],
+        "name": "Silverado Telemetry Node",
+        "model": "Pi 4 Pro",
+        "manufacturer": "Custom"
+    }
+    
     sensors = [
         {"id": "batt_v", "name": "Main Battery", "cmp": "sensor", "cls": "voltage", "unit": "V", "tpl": "{{ value_json.battery_voltage }}"},
         {"id": "ign_v", "name": "Ignition Signal", "cmp": "sensor", "cls": "voltage", "unit": "V", "tpl": "{{ value_json.ign_voltage }}"},
@@ -286,21 +345,36 @@ def publish_ha_discovery(client):
         {"id": "soc", "name": "Battery SoC", "cmp": "sensor", "cls": "battery", "unit": "%", "tpl": "{{ value_json.soc_percent | round(1) }}"},
         {"id": "cabin_t", "name": "Truck Cabin Temp", "cmp": "sensor", "cls": "temperature", "unit": "°C", "tpl": "{{ value_json.cabin_temp_c }}"},
         {"id": "cpu_t", "name": "Pi CPU Temp", "cmp": "sensor", "cls": "temperature", "unit": "°C", "tpl": "{{ value_json.cpu_temp_c }}"},
-        {"id": "fan_s", "name": "Argon Fan Speed", "cmp": "sensor", "unit": "%", "tpl": "{{ value_json.fan_speed_pct }}", "icon": "mdi:fan"},
+        {"id": "fan_s", "name": "Fan Duty Cycle", "cmp": "sensor", "unit": "%", "tpl": "{{ value_json.fan_speed_pct }}", "icon": "mdi:fan"},
+        {"id": "fan_rpm", "name": "Fan Speed (RPM)", "cmp": "sensor", "unit": "RPM", "tpl": "{{ value_json.fan_rpm }}", "icon": "mdi:fan-speed"},
         {"id": "pwr_q", "name": "Pi Power Quality", "cmp": "sensor", "tpl": "{{ value_json.power_status }}", "icon": "mdi:lightning-bolt"},
         {"id": "awake", "name": "Truck Power Status", "cmp": "binary_sensor", "cls": "power", "tpl": "{{ 'ON' if value_json.truck_awake else 'OFF' }}"}
     ]
+    
     for s in sensors:
         topic = f"homeassistant/{s['cmp']}/silverado_pi/{s['id']}/config"
-        payload = {"name": s['name'], "state_topic": f"{BASE_TOPIC}/system", "value_template": s['tpl'], "unique_id": f"silverado_{s['id']}", "device": device_info}
-        if "cls" in s: payload["device_class"] = s["cls"]
-        if "unit" in s: payload["unit_of_measurement"] = s["unit"]
-        if "icon" in s: payload["icon"] = s["icon"]
+        payload = {
+            "name": s['name'],
+            "state_topic": f"{BASE_TOPIC}/system",
+            "value_template": s['tpl'],
+            "unique_id": f"silverado_{s['id']}",
+            "device": device_info
+        }
+        if "cls" in s:
+            payload["device_class"] = s["cls"]
+        if "unit" in s:
+            payload["unit_of_measurement"] = s["unit"]
+        if "icon" in s:
+            payload["icon"] = s["icon"]
+            
         client.publish(topic, json.dumps(payload), retain=True)
 
 
 def main():
     init_hardware()
+    
+    # Initialize the Noctua Fan class
+    fan = NoctuaFan(pwm_pin=FAN_PWM_PIN, tach_pin=FAN_TACH_PIN)
 
     try:
         client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
@@ -329,7 +403,11 @@ def main():
         try:
             # 1. Grab environmental variables once per cycle
             cpu_temp = get_cpu_temp()
-            fan_speed = set_argon_fan_speed(get_fan_curve_speed(cpu_temp))
+            target_speed = get_fan_curve_speed(cpu_temp)
+            
+            fan_speed = fan.set_speed(target_speed)
+            fan_rpm = fan.get_rpm()
+            
             main_v = get_voltage(chan_f12_constant)
             ign_v = get_voltage(chan_f26_switched)
             cabin_t = get_cabin_temp()
@@ -385,6 +463,7 @@ def main():
                 "cabin_temp_c": cabin_t,
                 "cpu_temp_c": cpu_temp,
                 "fan_speed_pct": fan_speed,
+                "fan_rpm": fan_rpm,
                 "power_status": pwr_status,
                 "truck_awake": is_awake,
                 "cpu_usage_pct": psutil.cpu_percent() if psutil else 0
