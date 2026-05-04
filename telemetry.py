@@ -15,7 +15,6 @@ ADS = None
 AnalogIn = None
 board = None
 busio = None
-PWMOutputDevice = None
 DigitalInputDevice = None
 
 try:
@@ -38,7 +37,7 @@ except ImportError:
     pass
 
 try:
-    from gpiozero import PWMOutputDevice, DigitalInputDevice
+    from gpiozero import DigitalInputDevice
     GPIOZERO_AVAILABLE = True
 except ImportError:
     GPIOZERO_AVAILABLE = False
@@ -49,7 +48,7 @@ try:
 except ImportError:
     PYBAMM_AVAILABLE = False
 
-# --- CONFIGURATION & FILE PATHS ---
+# Load Configuration & Set File Paths
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(SCRIPT_DIR, 'config.json')
 
@@ -95,9 +94,12 @@ W1_DEVICE_BASE = '/sys/bus/w1/devices/'
 W1_DATA_GPIO = 23
 W1_POWER_GPIO = 24
 
-# Fan Pins (Mapped to your 1x2 signal header)
-FAN_PWM_PIN = 18
-FAN_TACH_PIN = 15
+# --- FAN CONFIG (Sysfs & GPIO) ---
+PWM_PATH = "/sys/class/pwm/pwmchip0"
+PWM_CHANNEL = "pwm0"
+PWM_FULL_PATH = f"{PWM_PATH}/{PWM_CHANNEL}"
+PWM_PERIOD_NS = 40000  # 25kHz Intel standard
+FAN_TACH_GPIO = 15     # Physical Pin 10
 
 # --- GLOBAL STATE ---
 i2c_bus = None
@@ -107,55 +109,59 @@ chan_current_vout = None
 chan_current_vref = None
 
 
-class NoctuaFan:
-    """Handles 25kHz PWM output and Tachometer RPM calculations for Noctua 4-pin fans."""
-    def __init__(self, pwm_pin, tach_pin):
-        self.pwm_pin = pwm_pin
-        self.tach_pin = tach_pin
+class TruckFanController:
+    """Manages 25kHz Hardware PWM via Linux Sysfs and RPM via GPIO interrupts."""
+    def __init__(self, tach_pin):
         self.tach_pulses = 0
-        self.last_time = time.monotonic()
+        self.last_tach_time = time.monotonic()
         self.current_rpm = 0
+        
+        # 1. Initialize Hardware PWM via Sysfs
+        try:
+            if not os.path.exists(PWM_FULL_PATH):
+                with open(f"{PWM_PATH}/export", "w") as f:
+                    f.write("0")
+                time.sleep(0.5)  # Wait for kernel to populate files
+                with open(f"{PWM_FULL_PATH}/period", "w") as f:
+                    f.write(str(PWM_PERIOD_NS))
+                with open(f"{PWM_FULL_PATH}/enable", "w") as f:
+                    f.write("1")
+        except Exception as e:
+            print(f"Warning: PWM Init Error (Are overlays correct?): {e}")
 
+        # 2. Initialize Tachometer via gpiozero
         if GPIOZERO_AVAILABLE:
             try:
-                # 25kHz is the Intel standard for 4-pin PWM computer fans
-                self.pwm = PWMOutputDevice(self.pwm_pin, frequency=25000)
-                # Tach uses an open-collector output, requires pull-up
-                self.tach = DigitalInputDevice(self.tach_pin, pull_up=True)
-                self.tach.when_activated = self._tach_callback
+                self.tach = DigitalInputDevice(tach_pin, pull_up=True)
+                self.tach.when_activated = self._count_pulse
             except Exception as e:
-                print(f"Failed to initialize fan on GPIO {pwm_pin}/{tach_pin}: {e}")
-                self.pwm = None
-                self.tach = None
-        else:
-            print("gpiozero library not found. Fan control disabled.")
-            self.pwm = None
-            self.tach = None
+                print(f"Warning: Tachometer Init Error: {e}")
 
-    def _tach_callback(self):
-        """Hardware interrupt callback for fan pulses."""
+    def _count_pulse(self):
         self.tach_pulses += 1
 
-    def set_speed(self, speed_percent):
-        """Sets the fan duty cycle (0-100)."""
-        if self.pwm:
-            speed_percent = max(0, min(100, speed_percent))
-            self.pwm.value = speed_percent / 100.0
-        return speed_percent
+    def set_speed(self, percent):
+        """Sets duty cycle 0-100%"""
+        percent = max(0, min(100, percent))
+        duty_cycle = int((percent / 100.0) * PWM_PERIOD_NS)
+        try:
+            with open(f"{PWM_FULL_PATH}/duty_cycle", "w") as f:
+                f.write(str(duty_cycle))
+        except Exception as e:
+            pass  # Fail silently to avoid crashing the telemetry loop
+        return percent
 
     def get_rpm(self):
-        """Calculates RPM based on pulses since last reading."""
+        """Calculates RPM from pulse counts."""
         now = time.monotonic()
-        dt = now - self.last_time
-
-        # Calculate only if enough time has passed to get a stable pulse count
-        if dt > 0.5:
-            # Standard PC fans output 2 pulses per revolution
-            # RPM = (pulses / 2) / (dt / 60) -> pulses * 30 / dt
+        dt = now - self.last_tach_time
+        
+        if dt > 1.0:
+            # 2 pulses per revolution for standard PC fans
             self.current_rpm = (self.tach_pulses * 30.0) / dt
             self.tach_pulses = 0
-            self.last_time = now
-
+            self.last_tach_time = now
+            
         return int(self.current_rpm)
 
 
@@ -167,7 +173,6 @@ class BatteryTracker:
 
         self.load_state()
 
-        # Initialize PyBaMM Equivalent Circuit Model (ECM)
         self.sim = None
         if PYBAMM_AVAILABLE:
             try:
@@ -179,12 +184,10 @@ class BatteryTracker:
                 self.sim = None
 
     def update(self, current_amps, voltage, dt_seconds):
-        # 1. Coulomb Counting (Ah Integration)
         ah_delta = (current_amps * dt_seconds) / 3600.0
         self.soc += (ah_delta / self.capacity_ah)
         self.soc = max(0.0, min(1.0, self.soc))
 
-        # Auto-Sync to 100% if floating/charging
         if voltage >= FLOAT_VOLTAGE_THRESHOLD and current_amps >= -0.5:
             self.float_timer += dt_seconds
             if self.float_timer >= FLOAT_TIME_THRESHOLD_SEC:
@@ -192,7 +195,6 @@ class BatteryTracker:
         else:
             self.float_timer = 0.0
 
-        # 2. PyBaMM ECM Correction
         if self.sim and dt_seconds > 0:
             try:
                 pass  # Placeholder for active step logic
@@ -300,12 +302,10 @@ def get_current_amps():
 
 
 def get_fan_curve_speed(temp_c):
-    if temp_c < 50:
-        return 0
-    if temp_c < 60:
-        return 35
-    if temp_c < 70:
-        return 65
+    if temp_c < 55: return 0
+    if temp_c < 60: return 30
+    if temp_c < 65: return 55
+    if temp_c < 70: return 80
     return 100
 
 
@@ -321,10 +321,8 @@ def get_power_status():
     try:
         res = subprocess.check_output(["vcgencmd", "get_throttled"], encoding='utf-8')
         val = int(res.strip().split('=')[1], 16)
-        if bool(val & 0x1):
-            return "Problem (Low Voltage)"
-        if bool(val & 0x10000):
-            return "Warning (Voltage Dip)"
+        if bool(val & 0x1): return "Problem (Low Voltage)"
+        if bool(val & 0x10000): return "Warning (Voltage Dip)"
         return "Stable"
     except Exception:
         return "Unknown"
@@ -337,7 +335,6 @@ def publish_ha_discovery(client):
         "model": "Pi 4 Pro",
         "manufacturer": "Custom"
     }
-    
     sensors = [
         {"id": "batt_v", "name": "Main Battery", "cmp": "sensor", "cls": "voltage", "unit": "V", "tpl": "{{ value_json.battery_voltage }}"},
         {"id": "ign_v", "name": "Ignition Signal", "cmp": "sensor", "cls": "voltage", "unit": "V", "tpl": "{{ value_json.ign_voltage }}"},
@@ -350,7 +347,6 @@ def publish_ha_discovery(client):
         {"id": "pwr_q", "name": "Pi Power Quality", "cmp": "sensor", "tpl": "{{ value_json.power_status }}", "icon": "mdi:lightning-bolt"},
         {"id": "awake", "name": "Truck Power Status", "cmp": "binary_sensor", "cls": "power", "tpl": "{{ 'ON' if value_json.truck_awake else 'OFF' }}"}
     ]
-    
     for s in sensors:
         topic = f"homeassistant/{s['cmp']}/silverado_pi/{s['id']}/config"
         payload = {
@@ -360,21 +356,15 @@ def publish_ha_discovery(client):
             "unique_id": f"silverado_{s['id']}",
             "device": device_info
         }
-        if "cls" in s:
-            payload["device_class"] = s["cls"]
-        if "unit" in s:
-            payload["unit_of_measurement"] = s["unit"]
-        if "icon" in s:
-            payload["icon"] = s["icon"]
-            
+        if "cls" in s: payload["device_class"] = s["cls"]
+        if "unit" in s: payload["unit_of_measurement"] = s["unit"]
+        if "icon" in s: payload["icon"] = s["icon"]
         client.publish(topic, json.dumps(payload), retain=True)
 
 
 def main():
     init_hardware()
-    
-    # Initialize the Noctua Fan class
-    fan = NoctuaFan(pwm_pin=FAN_PWM_PIN, tach_pin=FAN_TACH_PIN)
+    fan = TruckFanController(FAN_TACH_GPIO)
 
     try:
         client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
@@ -403,10 +393,11 @@ def main():
         try:
             # 1. Grab environmental variables once per cycle
             cpu_temp = get_cpu_temp()
-            target_speed = get_fan_curve_speed(cpu_temp)
+            fan_speed_target = get_fan_curve_speed(cpu_temp)
             
-            fan_speed = fan.set_speed(target_speed)
-            fan_rpm = fan.get_rpm()
+            # Apply and read fan hardware
+            current_fan_speed = fan.set_speed(fan_speed_target)
+            current_fan_rpm = fan.get_rpm()
             
             main_v = get_voltage(chan_f12_constant)
             ign_v = get_voltage(chan_f26_switched)
@@ -414,13 +405,13 @@ def main():
             pwr_status = get_power_status()
             is_awake = ign_v > AWAKE_THRESHOLD_V
 
-            # 2. FAST POLLING LOOP FOR CURRENT
-            cycle_duration = 10 if is_awake else 60
+            # 2. QUICK POLLING BURST FOR CURRENT (Fixed for fast updates)
+            # Burst-poll for just 1 second to catch any sudden starter cranking spikes
             start_time = time.monotonic()
             peak_draw = 0.0
             last_amps = 0.0
 
-            while time.monotonic() - start_time < cycle_duration:
+            while time.monotonic() - start_time < 1.0:
                 current = get_current_amps()
                 last_amps = current
                 if current < peak_draw:
@@ -462,8 +453,8 @@ def main():
                 "soc_percent": soc_percent,
                 "cabin_temp_c": cabin_t,
                 "cpu_temp_c": cpu_temp,
-                "fan_speed_pct": fan_speed,
-                "fan_rpm": fan_rpm,
+                "fan_speed_pct": current_fan_speed,
+                "fan_rpm": current_fan_rpm,
                 "power_status": pwr_status,
                 "truck_awake": is_awake,
                 "cpu_usage_pct": psutil.cpu_percent() if psutil else 0
@@ -479,11 +470,15 @@ def main():
                 pass
 
             client.publish(f"{BASE_TOPIC}/system", json.dumps(payload), qos=1)
-            print(f"[{time.strftime('%H:%M:%S')}] Payload: {payload}", flush=True)
+            print(f"[{time.strftime('%H:%M:%S')}] CPU: {cpu_temp}°C | Fan: {current_fan_speed}% ({current_fan_rpm} RPM)", flush=True)
 
             # Save SoC state periodically
-            if int(now) % 300 < cycle_duration:
+            if int(now) % 300 < 2:
                 tracker.save_state()
+            
+            # Sleep longer ONLY if the truck is parked to save battery
+            if not is_awake:
+                time.sleep(15)
 
         except Exception as e:
             print(f"CRITICAL LOOP ERROR: {e}", flush=True)
