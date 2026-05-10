@@ -1,14 +1,15 @@
+import datetime
 import json
+import logging
 import os
 import sys
 import time
-import logging
 import traceback
 
 # --- DIAGNOSTIC LOGGING ---
 LOG_FILE = '/home/brandon/telemetry_debug.log'
 logging.basicConfig(
-    filename=LOG_FILE, 
+    filename=LOG_FILE,
     level=logging.DEBUG,
     format='%(asctime)s [%(levelname)s] %(message)s'
 )
@@ -50,7 +51,14 @@ try:
     with open(CONFIG_PATH, 'r') as f:
         config = json.load(f)
 except Exception:
-    config = {"mqtt": {"broker": "homeassistant", "port": 1883, "user": "truck", "pass": "truck"}}
+    config = {
+        "mqtt": {
+            "broker": "homeassistant",
+            "port": 1883,
+            "user": "truck",
+            "pass": "truck"
+        }
+    }
 
 BROKER_IP = config.get('mqtt', {}).get('broker', 'homeassistant')
 BROKER_PORT = config.get('mqtt', {}).get('port', 1883)
@@ -70,7 +78,7 @@ SOC_STATE_FILE = os.path.join(SCRIPT_DIR, "soc_state.json")
 # --- FAN & PWM ---
 PWM_CHIP_PATH = "/sys/class/pwm/pwmchip0"
 PWM_FULL_PATH = f"{PWM_CHIP_PATH}/pwm0"
-PWM_PERIOD_NS = 40000 
+PWM_PERIOD_NS = 40000
 FAN_TACH_GPIO = 15
 
 # --- GLOBAL STATE ---
@@ -79,33 +87,43 @@ chan_ign_v = None
 chan_curr_vout = None
 chan_curr_vref = None
 
+
 class TruckFanController:
     def __init__(self, tach_pin):
         self.tach_pulses = 0
         self.last_tach_time = time.monotonic()
         self.current_rpm = 0
+        
         try:
             if not os.path.exists(PWM_FULL_PATH):
-                with open(f"{PWM_CHIP_PATH}/export", "w") as f: f.write("0")
+                with open(f"{PWM_CHIP_PATH}/export", "w") as f:
+                    f.write("0")
                 time.sleep(0.5)
-                with open(f"{PWM_FULL_PATH}/period", "w") as f: f.write(str(PWM_PERIOD_NS))
-                with open(f"{PWM_FULL_PATH}/enable", "w") as f: f.write("1")
-        except Exception: pass
-            
+                with open(f"{PWM_FULL_PATH}/period", "w") as f:
+                    f.write(str(PWM_PERIOD_NS))
+                with open(f"{PWM_FULL_PATH}/enable", "w") as f:
+                    f.write("1")
+        except Exception:
+            pass
+
         if GPIO_AVAILABLE:
             try:
                 self.tach = DigitalInputDevice(tach_pin, pull_up=True)
                 self.tach.when_activated = self._count_pulse
-            except Exception: pass
+            except Exception:
+                pass
 
-    def _count_pulse(self): self.tach_pulses += 1
+    def _count_pulse(self):
+        self.tach_pulses += 1
 
     def set_speed(self, percent):
         percent = max(0, min(100, percent))
         duty_cycle = int((percent / 100.0) * PWM_PERIOD_NS)
         try:
-            with open(f"{PWM_FULL_PATH}/duty_cycle", "w") as f: f.write(str(duty_cycle))
-        except Exception: pass
+            with open(f"{PWM_FULL_PATH}/duty_cycle", "w") as f:
+                f.write(str(duty_cycle))
+        except Exception:
+            pass
         return percent
 
     def get_rpm(self):
@@ -117,6 +135,7 @@ class TruckFanController:
             self.last_tach_time = now
         return int(self.current_rpm)
 
+
 class BatteryTracker:
     def __init__(self, capacity_ah):
         self.capacity_ah = capacity_ah
@@ -126,21 +145,25 @@ class BatteryTracker:
     def update(self, amps, volts, dt):
         self.soc += (amps * dt / 3600.0 / self.capacity_ah)
         self.soc = max(0.0, min(1.0, self.soc))
-        if volts >= 13.2 and amps >= -0.5: self.soc = 1.0
+        if volts >= 13.2 and amps >= -0.5:
+            self.soc = 1.0
         return self.soc * 100.0
 
     def save_state(self):
         try:
             with open(SOC_STATE_FILE, "w") as f:
                 json.dump({"soc_fraction": self.soc, "timestamp": time.time()}, f)
-        except Exception: pass
+        except Exception:
+            pass
 
     def load_state(self):
         try:
             if os.path.exists(SOC_STATE_FILE):
                 with open(SOC_STATE_FILE, "r") as f:
                     self.soc = json.load(f).get("soc_fraction", 1.0)
-        except Exception: pass
+        except Exception:
+            pass
+
 
 def init_hardware():
     global chan_main_v, chan_ign_v, chan_curr_vout, chan_curr_vref
@@ -154,56 +177,94 @@ def init_hardware():
             chan_curr_vout = AnalogIn(ads, 2)
             chan_curr_vref = AnalogIn(ads, 3)
             logging.info("ADS1115 Hardware initialized successfully.")
-        except Exception as e: 
+        except Exception as e:
             logging.error(f"ADS1115 Init Error: {e}")
+
+
+def bcd2dec(val):
+    """Converts Binary Coded Decimal to standard integer."""
+    return (val // 16 * 10) + (val & 0x0F)
+
+
+def sync_time_from_witty():
+    """Reads time from Witty Pi RTC and forces the system clock to match."""
+    try:
+        import smbus
+        bus = smbus.SMBus(1)
+        ADDR = 0x08
+        
+        # Read Registers 58-64 (RTC Time)
+        sec = bcd2dec(bus.read_byte_data(ADDR, 58) & 0x7F)
+        minute = bcd2dec(bus.read_byte_data(ADDR, 59))
+        hour = bcd2dec(bus.read_byte_data(ADDR, 60))
+        day = bcd2dec(bus.read_byte_data(ADDR, 61))
+        month = bcd2dec(bus.read_byte_data(ADDR, 63))
+        year = bcd2dec(bus.read_byte_data(ADDR, 64)) + 2000
+        bus.close()
+        
+        # Format the time and force the system to accept it
+        time_str = f"{year}-{month:02d}-{day:02d} {hour:02d}:{minute:02d}:{sec:02d}"
+        os.system(f"sudo date -s '{time_str}' > /dev/null 2>&1")
+        logging.info(f"System time forced to Witty Pi RTC: {time_str}")
+    except Exception as e:
+        logging.error(f"Failed to sync time from RTC: {e}")
+
 
 def get_witty_data():
     """
     Native Python I2C implementation mapping directly to Witty Pi 4 utilities.sh
     """
-    data = {"vin": 0.0, "vout": 0.0, "iout": 0.0, "temp_c": 0.0}
+    data = {
+        "vin": 0.0, "vout": 0.0, "iout": 0.0, "temp_c": 0.0,
+        "rtc_time": "Unknown"
+    }
     try:
         import smbus
         bus = smbus.SMBus(1)
-        
+
         # Witty Pi 4 I2C Address
         ADDR = 0x08
-        
+
         # Voltages and Current (Registers 1-6)
         vin_i = bus.read_byte_data(ADDR, 1)
         vin_d = bus.read_byte_data(ADDR, 2)
         data["vin"] = round(vin_i + (vin_d / 100.0), 2)
-        
+
         vout_i = bus.read_byte_data(ADDR, 3)
         vout_d = bus.read_byte_data(ADDR, 4)
         data["vout"] = round(vout_i + (vout_d / 100.0), 2)
-        
+
         iout_i = bus.read_byte_data(ADDR, 5)
         iout_d = bus.read_byte_data(ADDR, 6)
         data["iout"] = round(iout_i + (iout_d / 100.0), 2)
-        
+
         # Temperature (Register 50 / 0x32)
-        # Replicating utilities.sh bitwise operations: (((data&0xFF)<<8)|((data&0xFF00)>>8))>>5
         temp_bytes = bus.read_i2c_block_data(ADDR, 50, 2)
-        
-        # Reconstruct the 16-bit word natively
         t_data = (temp_bytes[0] << 8) | temp_bytes[1]
         t_data = t_data >> 5
-        
         if t_data >= 0x400:
             t_data = (t_data & 0x3FF) - 1024
-            
         data["temp_c"] = round(t_data * 0.125, 1)
-        
+
+        # RTC Time (Registers 58-64)
+        sec = bcd2dec(bus.read_byte_data(ADDR, 58) & 0x7F)
+        minute = bcd2dec(bus.read_byte_data(ADDR, 59))
+        hour = bcd2dec(bus.read_byte_data(ADDR, 60))
+        day = bcd2dec(bus.read_byte_data(ADDR, 61))
+        month = bcd2dec(bus.read_byte_data(ADDR, 63))
+        year = bcd2dec(bus.read_byte_data(ADDR, 64)) + 2000
+        data["rtc_time"] = f"{year}-{month:02d}-{day:02d} {hour:02d}:{minute:02d}:{sec:02d}"
+
         bus.close()
     except Exception as e:
         logging.error(f"Native SMBus Error: {e}")
-        
+
     return data
+
 
 def publish_ha_discovery(client):
     device = {"identifiers": ["truck_telemetry_v8"], "name": "Silverado Telemetry Node"}
-    
+
     sensors = [
         {"id": "batt_v", "name": "Battery (ADC)", "cls": "voltage", "unit": "V", "tpl": "{{ value_json.battery_voltage }}"},
         {"id": "ign_v", "name": "Ignition Signal", "cls": "voltage", "unit": "V", "tpl": "{{ value_json.ign_voltage }}"},
@@ -217,58 +278,77 @@ def publish_ha_discovery(client):
         {"id": "cpu_u", "name": "Pi CPU Usage", "unit": "%", "tpl": "{{ value_json.cpu_usage_pct }}", "icon": "mdi:cpu-64-bit"},
         {"id": "fan_s", "name": "Fan Duty Cycle", "unit": "%", "tpl": "{{ value_json.fan_speed_pct }}", "icon": "mdi:fan"},
         {"id": "fan_rpm", "name": "Fan Speed (RPM)", "unit": "RPM", "tpl": "{{ value_json.fan_rpm }}", "icon": "mdi:fan-speed"},
+        {"id": "rtc_time", "name": "RTC Time", "tpl": "{{ value_json.rtc_time }}", "icon": "mdi:clock-outline"},
+        {"id": "sys_time", "name": "System Time", "tpl": "{{ value_json.sys_time }}", "icon": "mdi:clock-outline"},
         {"id": "awake", "name": "Truck Power Status", "cmp": "binary_sensor", "cls": "power", "tpl": "{{ 'ON' if value_json.truck_awake else 'OFF' }}"}
     ]
+    
     for s in sensors:
         cmp = s.get("cmp", "sensor")
         topic = f"homeassistant/{cmp}/truck_v8/{s['id']}/config"
         payload = {
-            "name": s['name'], "state_topic": f"{BASE_TOPIC}/system", 
-            "value_template": s['tpl'], "unique_id": f"truck_v8_{s['id']}", 
-            "device": device, "unit_of_measurement": s.get("unit")
+            "name": s['name'],
+            "state_topic": f"{BASE_TOPIC}/system",
+            "value_template": s['tpl'],
+            "unique_id": f"truck_v8_{s['id']}",
+            "device": device,
+            "unit_of_measurement": s.get("unit")
         }
-        if "cls" in s: payload["device_class"] = s["cls"]
-        if "icon" in s: payload["icon"] = s["icon"]
+        if "cls" in s:
+            payload["device_class"] = s["cls"]
+        if "icon" in s:
+            payload["icon"] = s["icon"]
+            
         client.publish(topic, json.dumps(payload), retain=True)
+
 
 def main():
     init_hardware()
+    sync_time_from_witty()
+    
     fan = TruckFanController(FAN_TACH_GPIO)
     tracker = BatteryTracker(BATTERY_CAPACITY_AH)
+    
     try:
         client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
     except (AttributeError, TypeError):
         client = mqtt.Client()
-    
+
     client.username_pw_set(MQTT_USER, MQTT_PASS)
+    
     try:
         client.connect(BROKER_IP, BROKER_PORT, 60)
         client.loop_start()
         publish_ha_discovery(client)
-    except Exception as e: 
+    except Exception as e:
         logging.error(f"MQTT Connect Error: {e}")
 
     last_time = time.monotonic()
-    
+
     while True:
         try:
             now = time.monotonic()
-            
+
             # Read cleanly every loop now that native smbus is used
             witty_cache = get_witty_data()
-            
+
             # Read CPU Temp
             cpu_c = 0.0
             try:
                 with open("/sys/class/thermal/thermal_zone0/temp", "r") as f:
                     cpu_c = round(int(f.read()) / 1000.0, 1)
-            except Exception: pass
+            except Exception:
+                pass
 
             # Fan logic
             fan_speed_target = 0
-            if cpu_c > 55: fan_speed_target = 40
-            if cpu_c > 65: fan_speed_target = 75
-            if cpu_c > 75: fan_speed_target = 100
+            if cpu_c > 55:
+                fan_speed_target = 40
+            if cpu_c > 65:
+                fan_speed_target = 75
+            if cpu_c > 75:
+                fan_speed_target = 100
+                
             current_fan_speed = fan.set_speed(fan_speed_target)
             current_fan_rpm = fan.get_rpm()
 
@@ -277,37 +357,55 @@ def main():
             ign_v = 0.0
             amps = 0.0
             try:
-                if chan_main_v: main_v = round(chan_main_v.voltage * DIVIDER_FACTOR, 2)
-                if chan_ign_v: ign_v = round(chan_ign_v.voltage * DIVIDER_FACTOR, 2)
+                if chan_main_v:
+                    main_v = round(chan_main_v.voltage * DIVIDER_FACTOR, 2)
+                if chan_ign_v:
+                    ign_v = round(chan_ign_v.voltage * DIVIDER_FACTOR, 2)
                 if chan_curr_vout and chan_curr_vref:
                     raw_diff = chan_curr_vout.voltage - chan_curr_vref.voltage
                     amps = round((raw_diff - CURRENT_ZERO_OFFSET_V) / CURRENT_SENSITIVITY_V_PER_A, 2)
-            except Exception: pass
+            except Exception:
+                pass
 
             is_awake = ign_v > AWAKE_THRESHOLD_V
 
             dt = now - last_time
             last_time = now
             soc = tracker.update(amps, main_v, dt)
+            
+            # Format System Time
+            sys_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
             payload = {
                 "battery_voltage": main_v,
                 "ign_voltage": ign_v,
-                "witty_vin": witty_cache["vin"],
-                "witty_vout": witty_cache["vout"],
-                "witty_iout": witty_cache["iout"],
+                "witty_vin": witty_cache.get("vin", 0.0),
+                "witty_vout": witty_cache.get("vout", 0.0),
+                "witty_iout": witty_cache.get("iout", 0.0),
                 "current_amps": amps,
                 "soc_percent": soc,
                 "cpu_temp_c": cpu_c,
-                "witty_temp_c": witty_cache["temp_c"],
+                "witty_temp_c": witty_cache.get("temp_c", 0.0),
                 "fan_speed_pct": current_fan_speed,
                 "fan_rpm": current_fan_rpm,
                 "truck_awake": is_awake,
-                "cpu_usage_pct": psutil.cpu_percent() if psutil else 0
+                "cpu_usage_pct": psutil.cpu_percent() if psutil else 0,
+                "rtc_time": witty_cache.get("rtc_time", "Unknown"),
+                "sys_time": sys_time
             }
 
             client.publish(f"{BASE_TOPIC}/system", json.dumps(payload))
-            if int(now) % 300 < 2: tracker.save_state()
+
+            # Write data for dashcam script to view
+            try:
+                with open("/dev/shm/telemetry.json", "w") as f:
+                    json.dump(payload, f)
+            except Exception:
+                pass
+
+            if int(now) % 300 < 2:
+                tracker.save_state()
+                
             time.sleep(1)
 
         except Exception as e:
@@ -315,4 +413,7 @@ def main():
             logging.critical(traceback.format_exc())
             time.sleep(5)
 
-if __name__ == "__main__": main()
+
+if __name__ == "__main__":
+    main()
+
