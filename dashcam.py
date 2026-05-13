@@ -7,11 +7,25 @@ import signal
 import subprocess
 import threading
 import time
+import sys
 
 import psutil
 from flask import Flask, send_from_directory
 
 app = Flask(__name__)
+
+# --- GLOBAL SHUTDOWN STATE ---
+# This ensures both the Flask app and the recording thread exit cleanly.
+SHUTDOWN_EVENT = threading.Event()
+
+def signal_handler(sig, frame):
+    """Catches SIGTERM and SIGINT (Ctrl+C) to trigger a clean exit."""
+    print(f"\nShutdown signal ({sig}) received. Finalizing footage...")
+    SHUTDOWN_EVENT.set()
+
+# Register the signal traps
+signal.signal(signal.SIGTERM, signal_handler)
+signal.signal(signal.SIGINT, signal_handler)
 
 # --- PARSE COMMAND LINE ARGS ---
 parser = argparse.ArgumentParser(description="Silverado Dashcam Service")
@@ -59,7 +73,6 @@ def is_camera_present():
 
 
 def init_camera_focus():
-    """Forces the Logitech C922 to lock focus to infinity, disabling autofocus hunting."""
     try:
         subprocess.run(["v4l2-ctl", "-d", "/dev/video0", "-c", "focus_auto=0"],
                        check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -72,7 +85,6 @@ def init_camera_focus():
 
 
 def ensure_paths():
-    """Ensures directories exist and cleans old RAM stream files."""
     try:
         os.makedirs(RAM_DISK, exist_ok=True)
     except Exception as e:
@@ -103,7 +115,6 @@ def cleanup_old_footage():
 
 
 def get_telemetry():
-    """Safely extracts and formats telemetry data, guarding against missing or null JSON values."""
     d = get_telemetry_raw()
 
     def safe_float(key):
@@ -121,12 +132,9 @@ def get_telemetry():
 
 
 def generate_srt(srt_file, mkv_file, stop_event):
-    """Generates subtitle file, but ONLY if the MKV video file is successfully created first."""
     file_ready = False
-
-    # Wait up to 10 seconds for FFmpeg to actually create and start writing to the MKV
     for _ in range(10):
-        if stop_event.is_set():
+        if stop_event.is_set() or SHUTDOWN_EVENT.is_set():
             return
         if os.path.exists(mkv_file) and os.path.getsize(mkv_file) > 0:
             file_ready = True
@@ -134,25 +142,20 @@ def generate_srt(srt_file, mkv_file, stop_event):
         time.sleep(1.0)
 
     if not file_ready:
-        print(f"Notice: Video {mkv_file} failed to start. Skipping SRT creation.")
         return
 
     idx = 1
     start = time.monotonic()
     try:
         with open(srt_file, "w") as f:
-            while idx <= CHUNK_SECONDS and not stop_event.is_set():
+            while idx <= CHUNK_SECONDS and not stop_event.is_set() and not SHUTDOWN_EVENT.is_set():
                 elapsed = time.monotonic() - start
                 ts_now = datetime.datetime.now().strftime('%I:%M:%S %p')
                 v, a, soc = get_telemetry()
-
                 f.write(f"{idx}\n{str(datetime.timedelta(seconds=int(elapsed)))},000 --> "
                         f"{str(datetime.timedelta(seconds=int(elapsed+1)))},000\n")
-
-                # Updated subtitle format: Time | Bat | SoC
                 f.write(f"{ts_now} | Bat: {v}V {a}A | SoC: {soc}%\n\n")
                 f.flush()
-
                 idx += 1
                 time.sleep(1.0)
     except Exception as e:
@@ -160,7 +163,7 @@ def generate_srt(srt_file, mkv_file, stop_event):
 
 
 def record_loop():
-    while True:
+    while not SHUTDOWN_EVENT.is_set():
         if not is_camera_present():
             time.sleep(5.0)
             continue
@@ -169,7 +172,6 @@ def record_loop():
             time.sleep(2.0)
             continue
 
-        # --- TRUCK IS AWAKE: START RECORDING ---
         ensure_paths()
         cleanup_old_footage()
         init_camera_focus()
@@ -191,34 +193,27 @@ def record_loop():
         hls_segment_template = os.path.join(RAM_DISK, 'stream%d.ts')
 
         stop_srt_event = threading.Event()
-
-        # Pass the mkv_file into the thread so it can monitor it
         threading.Thread(target=generate_srt, args=(final_srt, mkv_file, stop_srt_event), daemon=True).start()
 
         encode_bitrate = TARGET_BITRATE if USE_COMPRESSION else "8M"
 
-        # Base Video Input (MJPEG from webcam)
         ffmpeg_cmd = [
             "ffmpeg", "-hide_banner", "-loglevel", "warning", "-y",
             "-f", "v4l2", "-input_format", "mjpeg", "-video_size", "1920x1080", "-framerate", "30",
             "-t", str(CHUNK_SECONDS), "-i", "/dev/video0"
         ]
 
-        # Add Audio Input (ALSA)
         if AUDIO_MIC:
             ffmpeg_cmd += ["-f", "alsa", "-channels", "2", "-i", AUDIO_MIC]
 
-        # Filter construction: Includes the audio high-pass and aggressive limiter
         v_filter = "vflip,hflip,format=yuv420p" if FLIP_VIDEO else "format=yuv420p"
         a_filter = "highpass=f=100,alimiter=limit=0.4:level=0:attack=2:release=50"
 
-        # Encoders (Hardware H264 + AAC)
         v_codec = ["-c:v", "h264_v4l2m2m", "-b:v", encode_bitrate, "-num_capture_buffers", "32", "-vf", v_filter]
         a_codec = ["-c:a", "aac", "-b:a", "128k", "-af", a_filter] if AUDIO_MIC else []
 
         ffmpeg_cmd += v_codec + a_codec
 
-        # Stream Mapping and Tee configuration
         if AUDIO_MIC:
             ffmpeg_cmd += ["-map", "0:v", "-map", "1:a"]
         else:
@@ -229,16 +224,17 @@ def record_loop():
             f"[f=hls:hls_time=2:hls_list_size=5:hls_flags=delete_segments:"
             f"hls_segment_filename={hls_segment_template}]{hls_playlist}"
         )
-
         ffmpeg_cmd += ["-flags", "+global_header", "-f", "tee", tee_map]
 
         try:
             process = subprocess.Popen(ffmpeg_cmd)
+            # Check for both logic (truck parked) AND system shutdown (SIGTERM)
             while process.poll() is None:
-                if not is_camera_present() or not is_driving():
-                    process.send_signal(signal.SIGINT)
+                if SHUTDOWN_EVENT.is_set() or not is_camera_present() or not is_driving():
+                    print("Stopping FFmpeg gracefully...")
+                    process.send_signal(signal.SIGINT) # FFmpeg needs INT to write MKV index
                     try:
-                        process.wait(timeout=5)
+                        process.wait(timeout=10) # Give it 10s to finalize
                     except subprocess.TimeoutExpired:
                         process.kill()
                     break
@@ -249,6 +245,8 @@ def record_loop():
 
         stop_srt_event.set()
         time.sleep(HW_BUFFER_SECONDS)
+
+    print("Dashcam recording thread has exited.")
 
 
 @app.route('/stream.m3u8')
@@ -265,6 +263,19 @@ def stream_ts(filename):
 
 if __name__ == "__main__":
     print("Starting Silverado Dashcam Service...")
-    threading.Thread(target=record_loop, daemon=True).start()
-    app.run(host='0.0.0.0', port=5000)
+    
+    # Start recording in a background thread
+    record_thread = threading.Thread(target=record_loop)
+    record_thread.start()
+    
+    # Start Flask (Main thread)
+    # Note: Flask's default reloader creates a second process; 
+    # use_reloader=False prevents double-execution in this setup.
+    try:
+        app.run(host='0.0.0.0', port=5000, use_reloader=False)
+    finally:
+        # If Flask exits (or is killed), ensure the recording thread stops
+        SHUTDOWN_EVENT.set()
+        record_thread.join()
+        print("Dashcam Service stopped.")
 
