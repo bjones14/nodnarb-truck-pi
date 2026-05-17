@@ -39,6 +39,10 @@ class PowerManager:
 
     def update(self, current_ign_v, current_main_v, current_amps):
         """Evaluates system state using voltage for ignition and current for charging."""
+        # ESCAPE HATCH: If a shutdown was already fired, freeze the state at PENDING
+        if self.shutdown_triggered:
+            return True, "SHUTDOWN_PENDING"
+
         now = time.monotonic()
 
         # 1. STATE: DRIVING (Ignition hot)
@@ -54,19 +58,15 @@ class PowerManager:
             self.low_ign_start_time = now
 
         # 2. EVALUATE NET ELECTRON TRAFFIC
-        # If amps are above our threshold, the battery is either gaining or maintaining charge
         if current_amps >= NET_DISCHARGE_THRESHOLD_A:
-            # Reset the discharge timer because electrons are stable/incoming
             self.continuous_discharge_start = None
 
-            # If we were in standard telemetry mode and see incoming current, upgrade to CHARGING
             if current_ign_v < IGNITION_OFF_V:
                 if not self.is_charging_mode:
                     logging.info(f"PowerManager: Net current positive/stable ({current_amps}A). Entering Garage Mode.")
                 self.is_charging_mode = True
                 return False, "CHARGING"
         else:
-            # We are actively bleeding energy from the battery
             if self.continuous_discharge_start is None:
                 self.continuous_discharge_start = now
 
@@ -74,11 +74,9 @@ class PowerManager:
         if self.is_charging_mode:
             elapsed_discharge = now - self.continuous_discharge_start if self.continuous_discharge_start else 0
 
-            # If we have been continuously depleting for longer than our window, the charger is gone
             if elapsed_discharge > CHARGER_DISCONNECT_DELAY_S:
                 logging.warning(f"PowerManager: Sustained depletion detected ({current_amps}A for {elapsed_discharge:.1f}s). Charger disconnected.")
                 self.is_charging_mode = False
-                # Fall back to immediate shutdown sequence since we already spent our garage window
                 return True, "SHUTDOWN_PENDING"
 
             return False, "CHARGING"
@@ -96,14 +94,18 @@ class PowerManager:
 
         return False, "SHUTDOWN_DEBOUNCE"
 
-
     def trigger_shutdown(self):
+        """Aggressively signals the OS to power off using multiple privilege strategies."""
         if not self.shutdown_triggered:
-            self.shutdown_triggered = True
             logging.warning("SYSTEM SHUTDOWN INITIATED BY CURRENT BALANCING AUDIT.")
+            self.shutdown_triggered = True
 
-            # systemctl handles the elevation without password prompts:
-            os.system("systemctl poweroff")
+        # We execute these every loop cycle. If Polkit blocks one, the next fallback will trip.
+        logging.debug("PowerManager: Executing system poweroff commands...")
+        os.system("systemctl poweroff")
+        os.system("sudo systemctl poweroff")
+        os.system("poweroff")
+        os.system("sudo poweroff")
 
 
 def main():
