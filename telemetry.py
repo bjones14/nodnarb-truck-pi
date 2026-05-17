@@ -68,13 +68,8 @@ BASE_TOPIC = "truck/pi"
 
 # --- CALIBRATION ---
 DIVIDER_FACTOR = 5.545
-VOLTAGE_ADC_DIVIDER_FACTOR = 1.00
+VOLTAGE_ADC_DIVIDER_FACTOR = 2.0
 AWAKE_THRESHOLD_V = 12.5
-CHARGER_ENTER_V = 12.90
-CHARGER_EXIT_V = 12.75
-IGNITION_OFF_V = 2.0
-IGNITION_OFF_DELAY_S = 120
-TELEMETRY_WINDOW_S = 300
 CURRENT_SENSITIVITY_V_PER_A = 0.003125
 CURRENT_ZERO_OFFSET_V = 0.0074
 BATTERY_CAPACITY_AH = 80.0
@@ -91,65 +86,6 @@ chan_main_v = None
 chan_ign_v = None
 chan_curr_vout = None
 chan_curr_vref = None
-
-
-class PowerManager:
-    """Manages ignition, telemetry, and Charging states with hysteresis."""
-
-    def __init__(self):
-        self.boot_time = time.monotonic()
-        self.low_ign_start_time = None
-        self.is_telemetry_mode = True
-        self.is_charging_mode = False
-        self.shutdown_triggered = False
-
-    def update(self, current_ign_v, current_main_v):
-        """Returns (should_shutdown, state_string)"""
-        now = time.monotonic()
-
-        # 1. DRIVING
-        if current_ign_v > AWAKE_THRESHOLD_V:
-            self.is_telemetry_mode = False
-            self.is_charging_mode = False
-            self.low_ign_start_time = None
-            return False, "DRIVING"
-
-        # 2. CHARGING (Garage Mode)
-        if current_ign_v < IGNITION_OFF_V:
-            if not self.is_charging_mode:
-                if current_main_v >= CHARGER_ENTER_V:
-                    self.is_charging_mode = True
-                    logging.info(f"PowerManager: Charger detected ({current_main_v}V).")
-            else:
-                if current_main_v < CHARGER_EXIT_V:
-                    self.is_charging_mode = False
-                    logging.info(f"PowerManager: Charger lost ({current_main_v}V).")
-
-        if self.is_charging_mode:
-            self.low_ign_start_time = None
-            return False, "CHARGING"
-
-        # 3. TELEMETRY
-        if self.is_telemetry_mode:
-            if (now - self.boot_time) > TELEMETRY_WINDOW_S:
-                return True, "SLEEPING"
-            return False, "TELEMETRY"
-
-        # 4. SHUTDOWN_DEBOUNCE
-        if self.low_ign_start_time is None:
-            self.low_ign_start_time = now
-
-        elapsed_off = now - self.low_ign_start_time
-        if elapsed_off > IGNITION_OFF_DELAY_S:
-            return True, "SHUTDOWN_PENDING"
-
-        return False, "SHUTDOWN_DEBOUNCE"
-
-    def trigger_shutdown(self):
-        if not self.shutdown_triggered:
-            self.shutdown_triggered = True
-            logging.warning("SYSTEM SHUTDOWN INITIATED.")
-            os.system("sudo shutdown -h now")
 
 
 class TruckFanController:
@@ -212,22 +148,14 @@ class BatteryTracker:
 
     def get_soc_from_voltage(self, volts):
         """Estimate SoC based on resting AGM voltage (Open Circuit)."""
-        if volts >= 12.85:
-            return 1.0
-        if volts >= 12.65:
-            return 0.85
-        if volts >= 12.50:
-            return 0.75
-        if volts >= 12.35:
-            return 0.60
-        if volts >= 12.20:
-            return 0.50
-        if volts >= 12.10:
-            return 0.40
-        if volts >= 12.00:
-            return 0.30
-        if volts >= 11.80:
-            return 0.15
+        if volts >= 12.85: return 1.0
+        if volts >= 12.65: return 0.85
+        if volts >= 12.50: return 0.75
+        if volts >= 12.35: return 0.60
+        if volts >= 12.20: return 0.50
+        if volts >= 12.10: return 0.40
+        if volts >= 12.00: return 0.30
+        if volts >= 11.80: return 0.15
         return 0.0
 
     def update(self, amps, volts, dt, temp_c=25.0):
@@ -274,7 +202,7 @@ def init_hardware():
             chan_ign_v = AnalogIn(ads, 1)
             chan_curr_vout = AnalogIn(ads, 2)
             chan_curr_vref = AnalogIn(ads, 3)
-            logging.info("ADS1115 initialized.")
+            logging.info("ADS1115 hardware initialized.")
         except Exception as e:
             logging.error(f"ADS1115 Init Error: {e}")
 
@@ -383,7 +311,6 @@ def main():
 
     fan = TruckFanController(FAN_TACH_GPIO)
     tracker = BatteryTracker(BATTERY_CAPACITY_AH)
-    pwr_manager = PowerManager()
 
     try:
         client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
@@ -431,7 +358,6 @@ def main():
             if chan_ign_v:
                 ign_v = round(chan_ign_v.voltage * DIVIDER_FACTOR, 3)
             if chan_curr_vout and chan_curr_vref:
-                # vref (A3) is the Voltage (ADC) rail for the UI
                 v_adc = round(chan_curr_vref.voltage * VOLTAGE_ADC_DIVIDER_FACTOR, 3)
                 diff = chan_curr_vout.voltage - chan_curr_vref.voltage
                 amps = round((diff - CURRENT_ZERO_OFFSET_V) / CURRENT_SENSITIVITY_V_PER_A, 2)
@@ -441,20 +367,29 @@ def main():
                 logging.info(f"SoC Initialized via OCV: {tracker.soc * 100.0}%")
                 is_first_loop = False
 
-            should_shutdown, pwr_state = pwr_manager.update(ign_v, main_v)
-            if should_shutdown:
-                pwr_manager.trigger_shutdown()
+            # --- DECOUPLED POWER STATE CHECK ---
+            # Read state from power-manager.py service, if running
+            pwr_state = "DISABLED"
+            if os.path.exists("/dev/shm/power_state.json"):
+                try:
+                    with open("/dev/shm/power_state.json", "r") as f:
+                        pwr_state = json.load(f).get("power_state", "DISABLED")
+                except Exception:
+                    pass
 
             dt = now - last_time
             last_time = now
             soc = tracker.update(amps, main_v, dt, temp_c=witty["temp_c"])
+
+            # Define truck awake condition with standalone override for safe bench testing
+            truck_is_awake = (pwr_state in ["DRIVING", "CHARGING"]) or (pwr_state == "DISABLED" and ign_v > AWAKE_THRESHOLD_V)
 
             payload = {
                 "battery_voltage": round(main_v, 2),
                 "ign_voltage": round(ign_v, 2),
                 "voltage_adc": round(v_adc, 2),
                 "power_state": pwr_state,
-                "truck_awake": (pwr_state in ["DRIVING", "CHARGING"]),
+                "truck_awake": truck_is_awake,
                 "witty_vin": witty["vin"],
                 "witty_vout": witty["vout"],
                 "witty_iout": witty["iout"],
@@ -468,7 +403,16 @@ def main():
                 "sys_time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             }
 
+            # Publish payload to Home Assistant / MQTT
             client.publish(f"{BASE_TOPIC}/system", json.dumps(payload))
+
+            # Export payload to RAM disk for dashcam.py and power-manager.py
+            try:
+                with open("/dev/shm/telemetry.json", "w") as f:
+                    json.dump(payload, f)
+            except Exception as e:
+                logging.error(f"IPC Error writing telemetry.json: {e}")
+
             if int(now) % 300 < 2:
                 tracker.save_state()
             time.sleep(1)
