@@ -68,7 +68,7 @@ BASE_TOPIC = "truck/pi"
 
 # --- CALIBRATION ---
 DIVIDER_FACTOR = 5.545
-VOLTAGE_ADC_DIVIDER_FACTOR = 1.00
+VOLTAGE_ADC_DIVIDER_FACTOR = 2.0
 AWAKE_THRESHOLD_V = 12.5
 CHARGER_ENTER_V = 12.90
 CHARGER_EXIT_V = 12.75
@@ -94,7 +94,7 @@ chan_curr_vref = None
 
 
 class PowerManager:
-    """Manages ignition, telemetry, and Charging states with hysteresis."""
+    """Manages power states with hysteresis for garage charging."""
 
     def __init__(self):
         self.boot_time = time.monotonic()
@@ -274,7 +274,7 @@ def init_hardware():
             chan_ign_v = AnalogIn(ads, 1)
             chan_curr_vout = AnalogIn(ads, 2)
             chan_curr_vref = AnalogIn(ads, 3)
-            logging.info("ADS1115 initialized.")
+            logging.info("ADS1115 hardware initialized.")
         except Exception as e:
             logging.error(f"ADS1115 Init Error: {e}")
 
@@ -431,7 +431,7 @@ def main():
             if chan_ign_v:
                 ign_v = round(chan_ign_v.voltage * DIVIDER_FACTOR, 3)
             if chan_curr_vout and chan_curr_vref:
-                # vref (A3) is the Voltage (ADC) rail for the UI
+                # Use factor of 2.0 to show the 5V supply rail health on the dashboard
                 v_adc = round(chan_curr_vref.voltage * VOLTAGE_ADC_DIVIDER_FACTOR, 3)
                 diff = chan_curr_vout.voltage - chan_curr_vref.voltage
                 amps = round((diff - CURRENT_ZERO_OFFSET_V) / CURRENT_SENSITIVITY_V_PER_A, 2)
