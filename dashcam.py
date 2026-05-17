@@ -15,7 +15,6 @@ from flask import Flask, send_from_directory
 app = Flask(__name__)
 
 # --- GLOBAL SHUTDOWN STATE ---
-# This ensures both the Flask app and the recording thread exit cleanly.
 SHUTDOWN_EVENT = threading.Event()
 
 def signal_handler(sig, frame):
@@ -23,7 +22,6 @@ def signal_handler(sig, frame):
     print(f"\nShutdown signal ({sig}) received. Finalizing footage...")
     SHUTDOWN_EVENT.set()
 
-# Register the signal traps
 signal.signal(signal.SIGTERM, signal_handler)
 signal.signal(signal.SIGINT, signal_handler)
 
@@ -62,10 +60,23 @@ def get_telemetry_raw():
     return {}
 
 
-def is_driving():
+def should_run_camera():
+    """Evaluates explicit power states to activate the full recording/streaming stack."""
     if IGNORE_PARKED:
         return True
-    return get_telemetry_raw().get('truck_awake', False)
+
+    telemetry = get_telemetry_raw()
+    pwr_state = telemetry.get('power_state', 'DISABLED')
+
+    # Run the pipeline when actively driving OR when plugged into the charger
+    if pwr_state in ["DRIVING", "CHARGING"]:
+        return True
+
+    # Standalone bench-testing fallback if the power-manager service is turned off
+    if pwr_state == "DISABLED" and telemetry.get('ign_voltage', 0.0) > 12.5:
+        return True
+
+    return False
 
 
 def is_camera_present():
@@ -168,7 +179,7 @@ def record_loop():
             time.sleep(5.0)
             continue
 
-        if not is_driving():
+        if not should_run_camera():
             time.sleep(2.0)
             continue
 
@@ -199,6 +210,7 @@ def record_loop():
 
         ffmpeg_cmd = [
             "ffmpeg", "-hide_banner", "-loglevel", "warning", "-y",
+            "-fflags", "+discardcorrupt",
             "-f", "v4l2", "-input_format", "mjpeg", "-video_size", "1920x1080", "-framerate", "30",
             "-t", str(CHUNK_SECONDS), "-i", "/dev/video0"
         ]
@@ -226,15 +238,17 @@ def record_loop():
         )
         ffmpeg_cmd += ["-flags", "+global_header", "-f", "tee", tee_map]
 
+        # Track execution timestamp to evaluate runtime performance
+        ffmpeg_start_time = time.monotonic()
+
         try:
             process = subprocess.Popen(ffmpeg_cmd)
-            # Check for both logic (truck parked) AND system shutdown (SIGTERM)
             while process.poll() is None:
-                if SHUTDOWN_EVENT.is_set() or not is_camera_present() or not is_driving():
+                if SHUTDOWN_EVENT.is_set() or not is_camera_present() or not should_run_camera():
                     print("Stopping FFmpeg gracefully...")
-                    process.send_signal(signal.SIGINT) # FFmpeg needs INT to write MKV index
+                    process.send_signal(signal.SIGINT)
                     try:
-                        process.wait(timeout=10) # Give it 10s to finalize
+                        process.wait(timeout=10)
                     except subprocess.TimeoutExpired:
                         process.kill()
                     break
@@ -244,7 +258,14 @@ def record_loop():
             print(f"FFmpeg process encountered an error: {e}")
 
         stop_srt_event.set()
-        time.sleep(HW_BUFFER_SECONDS)
+
+        # Anti-Spin Throttle: Protect CPU from rapid failure loops in low-light environments
+        ffmpeg_runtime = time.monotonic() - ffmpeg_start_time
+        if ffmpeg_runtime < 5.0 and not SHUTDOWN_EVENT.is_set():
+            print(f"FFmpeg exited unexpectedly fast ({ffmpeg_runtime:.1f}s). Throttling next spin-up...")
+            time.sleep(5.0)
+        else:
+            time.sleep(HW_BUFFER_SECONDS)
 
     print("Dashcam recording thread has exited.")
 
@@ -263,18 +284,13 @@ def stream_ts(filename):
 
 if __name__ == "__main__":
     print("Starting Silverado Dashcam Service...")
-    
-    # Start recording in a background thread
+
     record_thread = threading.Thread(target=record_loop)
     record_thread.start()
-    
-    # Start Flask (Main thread)
-    # Note: Flask's default reloader creates a second process; 
-    # use_reloader=False prevents double-execution in this setup.
+
     try:
         app.run(host='0.0.0.0', port=5000, use_reloader=False)
     finally:
-        # If Flask exits (or is killed), ensure the recording thread stops
         SHUTDOWN_EVENT.set()
         record_thread.join()
         print("Dashcam Service stopped.")

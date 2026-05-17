@@ -4,6 +4,7 @@
 
 # Explicitly ALLOW (un-ignore) your truck project files
 
+!power-manager.py
 !dashcam.py
 !telemetry.py
 !config.json
