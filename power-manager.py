@@ -96,11 +96,14 @@ class PowerManager:
 
         return False, "SHUTDOWN_DEBOUNCE"
 
+
     def trigger_shutdown(self):
         if not self.shutdown_triggered:
             self.shutdown_triggered = True
             logging.warning("SYSTEM SHUTDOWN INITIATED BY CURRENT BALANCING AUDIT.")
-            os.system("sudo shutdown -h now")
+
+            # systemctl handles the elevation without password prompts:
+            os.system("systemctl poweroff")
 
 
 def main():
